@@ -1,0 +1,593 @@
+import pandas as pd
+import numpy as np
+import pvlib
+import warnings
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from datetime import datetime
+warnings.filterwarnings('ignore')
+
+# Impostazioni per i grafici
+plt.rcParams['font.size'] = 10
+plt.rcParams['axes.titlesize'] = 12
+plt.rcParams['axes.labelsize'] = 10
+
+
+class PVSystem:
+    def __init__(self, latitude, longitude):
+        self.latitude = latitude
+        self.longitude = longitude
+
+        # Orientamento
+        self.tilt = 30
+        self.azimuth_pvlib = 180
+
+        # Moduli
+        self.num_panels = 5
+        self.panel_power_stc = 435
+        self.panel_efficiency_stc = 0.218
+        self.temperature_coefficient_pmax = -0.0034
+
+        # Temperatura
+        self.NOCT_datasheet = 43
+        self.roof_delta = 2
+        self.NOCT_effective = self.NOCT_datasheet + self.roof_delta
+
+        # Area
+        self.module_area = 1.762 * 1.134
+        self.total_area = self.num_panels * self.module_area
+
+        # Perdite di sistema
+        self.PR_ref = 0.94
+        self.inverter_eff = 0.96
+
+        self.installed_power_kw = (self.num_panels * self.panel_power_stc) / 1000
+
+        # Parametri Sandia
+        self.a_sandia = -3.48
+        self.b_sandia = -0.080
+
+        # Correzione PR in base alla latitudine
+        if self.latitude >= 50:
+            self.pr_a, self.pr_b = 0.88, 0.12
+        elif self.latitude >= 40:
+            self.pr_a, self.pr_b = 0.90, 0.10
+        else:
+            self.pr_a, self.pr_b = 0.92, 0.08
+
+        print("\n" + "="*60)
+        print(f"CONFIGURAZIONE SISTEMA FOTOVOLTAICO")
+        print("="*60)
+        print(f"Potenza installata:     {self.installed_power_kw:.2f} kWp")
+        print(f"Latitudine:             {self.latitude}°")
+        print(f"Longitudine:            {self.longitude}°")
+        print(f"Inclinazione moduli:    {self.tilt}°")
+        print(f"Azimut:                 {self.azimuth_pvlib}°")
+        print(f"Numero pannelli:        {self.num_panels}")
+        print(f"Area totale:            {self.total_area:.2f} m²")
+        print(f"Efficienza riferimento: {self.panel_efficiency_stc*100:.1f}%")
+        print(f"PR riferimento:         {self.PR_ref*100:.1f}%")
+        print(f"Efficienza inverter:    {self.inverter_eff*100:.1f}%")
+        print("="*60)
+
+
+def build_tmy_from_multiyear(system):
+    """Scarica i dati da PVGIS e costruisce un TMY"""
+   
+    print("\n[1/3] Scaricamento dati meteorologici da PVGIS...")
+    print(f"      Periodo: 2005-2020")
+   
+    res = pvlib.iotools.get_pvgis_hourly(
+        latitude=system.latitude,
+        longitude=system.longitude,
+        start=2005,
+        end=2020,
+        surface_tilt=system.tilt,
+        surface_azimuth=system.azimuth_pvlib,
+        components=True,
+        usehorizon=True,
+        raddatabase='PVGIS-SARAH3'
+    )
+
+    data = res[0].copy()
+
+    # Tolgo il 29 febbraio per evitare problemi con gli anni bisestili
+    data = data[~((data.index.month == 2) & (data.index.day == 29))]
+
+    # Calcolo la POA globale
+    data['poa_global'] = (
+        data['poa_direct'] +
+        data['poa_sky_diffuse'] +
+        data['poa_ground_diffuse']
+    )
+
+    # Produzione di riferimento da PVGIS
+    if 'P' in data.columns:
+        data['pvgis_prod_kwh'] = data['P'] / 1000
+    else:
+        # Fallback se la colonna P non c'è
+        data['pvgis_prod_kwh'] = (
+            data['poa_global'] / 1000
+        ) * system.installed_power_kw * 0.84
+
+    # Creo un TMY facendo la media su tutti gli anni
+    tmy = data.groupby(
+        [data.index.month, data.index.day, data.index.hour]
+    ).mean()
+
+    # Uso il 2015 (non bisestile) come calendario
+    index = pd.date_range(start='2015-01-01', periods=8760, freq='h')
+
+    result = pd.DataFrame(index=index)
+    result['poa_global'] = tmy['poa_global'].values
+    result['temp_air'] = tmy['temp_air'].values
+    result['pvgis_ref_kwh'] = tmy['pvgis_prod_kwh'].values
+   
+    print(f"      Dati scaricati: {len(result)} ore")
+    print(f"      POA media annua: {result['poa_global'].mean():.1f} W/m²")
+    print(f"      Temperatura media: {result['temp_air'].mean():.1f}°C")
+
+    return result
+
+
+def calculate_daily_data(system, hourly):
+    """Calcola la produzione oraria e poi giornaliera"""
+   
+    print("\n[2/3] Calcolo della produzione oraria...")
+   
+    # Clearness index
+    hourly['kt'] = np.clip(hourly['poa_global'] / 1000, 0, 1)
+
+    # PR dinamico
+    hourly['pr_dyn'] = system.PR_ref * (
+        system.pr_a + system.pr_b * hourly['kt']
+    )
+
+    # Vento
+    month = hourly.index.month
+    wind_speed = np.where(
+        (month >= 5) & (month <= 8),
+        0.8,   # estate poco vento
+        np.where(
+            (month <= 2) | (month >= 11),
+            1.5,  # inverno più vento
+            1.1   # primavera/autunno
+        )
+    )
+
+    # Temperatura cella con Sandia
+    hourly['t_cell'] = hourly['temp_air'] + \
+        hourly['poa_global'] * np.exp(
+            system.a_sandia + system.b_sandia * wind_speed
+        )
+
+    # Efficienza pannello (oraria)
+    hourly['eff_panel'] = system.panel_efficiency_stc * (
+        1 + system.temperature_coefficient_pmax *
+        (hourly['t_cell'] - 25)
+    )
+   
+    # Efficienza sistema totale (oraria)
+    hourly['eff_system'] = hourly['eff_panel'] * hourly['pr_dyn'] * system.inverter_eff
+
+    # Produzione oraria
+    hourly['prod_h'] = (
+        hourly['poa_global'] / 1000
+    ) * system.total_area * hourly['eff_panel'] * \
+        hourly['pr_dyn'] * system.inverter_eff
+
+    # Aggrego per giorno
+    daily = hourly.resample('D').agg({
+        'prod_h': 'sum',
+        'pvgis_ref_kwh': 'sum',
+        'temp_air': 'mean',      # Temperatura ambiente media giornaliera
+        't_cell': 'mean',        # Temperatura cella media giornaliera
+        'eff_panel': 'mean',     # Efficienza pannello media giornaliera
+        'eff_system': 'mean'     # Efficienza sistema media giornaliera
+    })
+
+    daily.rename(columns={
+        'prod_h': 'prod_mio',
+        'pvgis_ref_kwh': 'prod_pvgis',
+        'temp_air': 'temp_ambiente_media_c',
+        't_cell': 'temp_cella_media_c',
+        'eff_panel': 'eff_pannello_media',
+        'eff_system': 'eff_sistema_media'
+    }, inplace=True)
+   
+    # Aggiungo colonne utili per l'analisi
+    daily['giorno'] = daily.index.day
+    daily['mese'] = daily.index.month
+    daily['data_str'] = daily.index.strftime('%m-%d')
+   
+    # Errore assoluto e percentuale giornaliero
+    daily['errore_kwh'] = daily['prod_mio'] - daily['prod_pvgis']
+    daily['errore_perc'] = (daily['errore_kwh'] / daily['prod_pvgis']) * 100
+   
+    # Efficienze in percentuale
+    daily['eff_pannello_perc'] = daily['eff_pannello_media'] * 100
+    daily['eff_sistema_perc'] = daily['eff_sistema_media'] * 100
+   
+    print(f"      Calcolate {len(daily)} giornate")
+    print(f"      Produzione media giornaliera (modello): {daily['prod_mio'].mean():.2f} kWh")
+    print(f"      Produzione media giornaliera (PVGIS):   {daily['prod_pvgis'].mean():.2f} kWh")
+    print(f"      Temperatura ambiente media: {daily['temp_ambiente_media_c'].mean():.1f}°C")
+    print(f"      Temperatura cella media:    {daily['temp_cella_media_c'].mean():.1f}°C")
+    print(f"      Efficienza pannello media:  {daily['eff_pannello_perc'].mean():.2f}%")
+    print(f"      Efficienza sistema media:   {daily['eff_sistema_perc'].mean():.2f}%")
+   
+    return daily
+
+
+def calculate_monthly_metrics(daily):
+    """Calcola le metriche di errore per ogni mese"""
+   
+    monthly_metrics = []
+    mesi_nomi = ['January', 'February', 'March', 'April', 'May', 'June',
+                 'July', 'August', 'September', 'October', 'November', 'December']
+   
+    for month in range(1, 13):
+        monthly_data = daily[daily['mese'] == month]
+        err = monthly_data['prod_mio'] - monthly_data['prod_pvgis']
+       
+        if len(monthly_data) > 0:
+            mape = np.mean(np.abs(err / monthly_data['prod_pvgis'])) * 100
+            mbe = np.mean(err)
+            rmse = np.sqrt(np.mean(err**2))
+            mae = np.mean(np.abs(err))
+           
+            monthly_metrics.append({
+                'Month': mesi_nomi[month-1],
+                'Days': len(monthly_data),
+                'Model_Total_kWh': monthly_data['prod_mio'].sum(),
+                'PVGIS_Total_kWh': monthly_data['prod_pvgis'].sum(),
+                'MAPE_%': mape,
+                'MBE_kWh': mbe,
+                'RMSE_kWh': rmse,
+                'MAE_kWh': mae
+            })
+   
+    return pd.DataFrame(monthly_metrics)
+
+
+def calculate_metrics(daily):
+    """Calcola e stampa metriche di errore annuali e mensili"""
+   
+    err = daily['prod_mio'] - daily['prod_pvgis']
+   
+    # Metriche annuali
+    mape = np.mean(np.abs(err / daily['prod_pvgis'])) * 100
+    mbe = np.mean(err)
+    rmse = np.sqrt(np.mean(err**2))
+    mae = np.mean(np.abs(err))
+    nrmse = rmse / daily['prod_pvgis'].mean() * 100
+    r2 = 1 - (np.sum(err**2) / np.sum((daily['prod_pvgis'] - daily['prod_pvgis'].mean())**2))
+   
+    print("\n" + "="*60)
+    print("ERROR METRICS - ANNUAL SCALE")
+    print("="*60)
+    print(f"MAPE  (Mean Absolute Percentage Error):  {mape:.3f}%")
+    print(f"MBE   (Mean Bias Error):                {mbe:.4f} kWh")
+    print(f"RMSE  (Root Mean Square Error):         {rmse:.4f} kWh")
+    print(f"MAE   (Mean Absolute Error):            {mae:.4f} kWh")
+    print(f"NRMSE (Normalized RMSE):                {nrmse:.3f}%")
+    print(f"R²    (Coefficient of determination):   {r2:.4f}")
+    print("="*60)
+   
+    # Calcolo metriche mensili
+    monthly_metrics = calculate_monthly_metrics(daily)
+   
+    print("\n" + "="*80)
+    print("ERROR METRICS - MONTHLY SCALE")
+    print("="*80)
+    print(monthly_metrics.to_string(index=False))
+    print("="*80)
+   
+    return {
+        'Annual': {
+            'MAPE (%)': mape,
+            'MBE (kWh)': mbe,
+            'RMSE (kWh)': rmse,
+            'MAE (kWh)': mae,
+            'NRMSE (%)': nrmse,
+            'R²': r2
+        },
+        'Monthly': monthly_metrics
+    }
+
+
+def print_report(daily):
+    """Stampa report mensile dettagliato"""
+   
+    monthly = daily.resample('M').agg({
+        'prod_mio': 'sum',
+        'prod_pvgis': 'sum',
+        'errore_kwh': 'sum',
+        'errore_perc': 'mean',
+        'temp_ambiente_media_c': 'mean',
+        'temp_cella_media_c': 'mean',
+        'eff_pannello_media': 'mean',
+        'eff_sistema_media': 'mean'
+    })
+   
+    # Converto le efficienze in percentuale per il report mensile
+    monthly['eff_pannello_perc'] = monthly['eff_pannello_media'] * 100
+    monthly['eff_sistema_perc'] = monthly['eff_sistema_media'] * 100
+   
+    print("\n" + "="*80)
+    print("MONTHLY PRODUCTION REPORT")
+    print("="*80)
+    print(f"{'MONTH':<6} | {'MODEL (kWh)':>10} | {'PVGIS (kWh)':>12} | {'DIFF (kWh)':>10} | {'DIFF %':>8} | {'T_AMB (°C)':>10} | {'T_CELL (°C)':>10} | {'EFF_PAN(%)':>10} | {'EFF_SYS(%)':>10}")
+    print("-"*80)
+   
+    mesi = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+            'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+   
+    for i, row in enumerate(monthly.itertuples()):
+        print(f"{mesi[i]:<6} | {row.prod_mio:>10.1f} | {row.prod_pvgis:>12.1f} | {row.errore_kwh:>10.2f} | {row.errore_perc:>7.2f}% | {row.temp_ambiente_media_c:>10.1f} | {row.temp_cella_media_c:>10.1f} | {row.eff_pannello_perc:>9.2f}% | {row.eff_sistema_perc:>9.2f}%")
+
+    # Totali annuali
+    tot_mio = daily['prod_mio'].sum()
+    tot_pvgis = daily['prod_pvgis'].sum()
+    tot_err = tot_mio - tot_pvgis
+    diff_tot = (tot_err / tot_pvgis) * 100
+   
+    print("-"*80)
+    print(f"{'TOTAL':<6} | {tot_mio:>10.1f} | {tot_pvgis:>12.1f} | {tot_err:>10.2f} | {diff_tot:>7.2f}% | {'-':>10} | {'-':>10} | {'-':>10} | {'-':>10}")
+    print("="*80)
+   
+    return monthly
+
+
+def create_plots(daily, monthly):
+    """Create the requested plots with English labels"""
+   
+    # Create figure with 3 subplots
+    fig, axes = plt.subplots(3, 1, figsize=(14, 12))
+   
+    # PLOT 1: Panel Efficiency vs Cell Temperature (monthly trends, opposite behavior)
+    ax1 = axes[0]
+   
+    # Calculate monthly averages
+    monthly_eff = daily.groupby('mese')['eff_pannello_perc'].mean()
+    monthly_temp = daily.groupby('mese')['temp_cella_media_c'].mean()
+   
+    months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+              'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+   
+    x = range(1, 13)
+   
+    # Line for efficiency (left y-axis)
+    line1 = ax1.plot(x, monthly_eff.values, 'b-o', linewidth=2.5, markersize=7,
+                     label='Panel Efficiency (%)', color='blue')
+    ax1.set_xlabel('Month', fontsize=11)
+    ax1.set_ylabel('Panel Efficiency (%)', color='blue', fontsize=11)
+    ax1.tick_params(axis='y', labelcolor='blue')
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(months)
+    ax1.set_title('Monthly Panel Efficiency vs Cell Temperature\n(Opposite Trends)',
+                  fontsize=12, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+   
+    # Line for temperature (right y-axis)
+    ax1_twin = ax1.twinx()
+    line2 = ax1_twin.plot(x, monthly_temp.values, 'r-o', linewidth=2.5, markersize=7,
+                          label='Cell Temperature (°C)', color='red')
+    ax1_twin.set_ylabel('Cell Temperature (°C)', color='red', fontsize=11)
+    ax1_twin.tick_params(axis='y', labelcolor='red')
+   
+    # Combined legend
+    lines = line1 + line2
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, loc='upper right')
+   
+    
+    max_temp_month = monthly_temp.idxmax()
+    min_eff_month = monthly_eff.idxmin()
+    ax1.annotate(f'Max Cell Temp\n{monthly_temp[max_temp_month]:.1f}°C',
+                 xy=(max_temp_month, monthly_temp[max_temp_month]),
+                 xytext=(max_temp_month+0.5, monthly_temp[max_temp_month]+2),
+                 arrowprops=dict(arrowstyle='->', color='red', lw=1.5),
+                 fontsize=9, color='red', fontweight='bold')
+    ax1.annotate(f'Min Efficiency\n{monthly_eff[min_eff_month]:.1f}%',
+                 xy=(min_eff_month, monthly_eff[min_eff_month]),
+                 xytext=(min_eff_month-1.5, monthly_eff[min_eff_month]-1),
+                 arrowprops=dict(arrowstyle='->', color='blue', lw=1.5),
+                 fontsize=9, color='blue', fontweight='bold')
+   
+    # PLOT 2: Daily production comparison (Model vs PVGIS)
+    ax2 = axes[1]
+   
+    # Create 7-day moving average for smoothing
+    daily_smooth = daily.copy()
+    daily_smooth['prod_mio_smooth'] = daily_smooth['prod_mio'].rolling(window=7, center=True).mean()
+    daily_smooth['prod_pvgis_smooth'] = daily_smooth['prod_pvgis'].rolling(window=7, center=True).mean()
+   
+    # Plot daily data with low opacity
+    ax2.plot(daily.index, daily['prod_mio'], alpha=0.2, linewidth=0.5, color='blue',
+             label='Model (daily)')
+    ax2.plot(daily.index, daily['prod_pvgis'], alpha=0.2, linewidth=0.5, color='green',
+             label='PVGIS (daily)')
+   
+    # Plot smoothed data
+    ax2.plot(daily.index, daily_smooth['prod_mio_smooth'], linewidth=2.5, color='darkblue',
+             label='Model (7-day MA)', linestyle='-')
+    ax2.plot(daily.index, daily_smooth['prod_pvgis_smooth'], linewidth=2.5, color='darkgreen',
+             label='PVGIS (7-day MA)', linestyle='-')
+   
+    ax2.set_xlabel('Date', fontsize=11)
+    ax2.set_ylabel('Daily Production (kWh)', fontsize=11)
+    ax2.set_title('Daily Production Comparison: Model vs PVGIS\n(with 7-day Moving Average)',
+                  fontsize=12, fontweight='bold')
+    ax2.legend(loc='upper right')
+    ax2.grid(True, alpha=0.3)
+   
+    # Format x-axis with months
+    ax2.xaxis.set_major_formatter(mdates.DateFormatter('%b'))
+    ax2.xaxis.set_major_locator(mdates.MonthLocator())
+   
+    # PLOT 3: Monthly error metrics (MAPE and MBE)
+    ax3 = axes[2]
+   
+    # Calculate monthly metrics for plotting
+    monthly_errors = []
+    months_short = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+                    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+   
+    for month in range(1, 13):
+        monthly_data = daily[daily['mese'] == month]
+        if len(monthly_data) > 0:
+            err = monthly_data['prod_mio'] - monthly_data['prod_pvgis']
+            mape = np.mean(np.abs(err / monthly_data['prod_pvgis'])) * 100
+            mbe = np.mean(err)
+            monthly_errors.append({'month': month, 'MAPE': mape, 'MBE': mbe})
+   
+    monthly_errors_df = pd.DataFrame(monthly_errors)
+   
+    # Bar chart for MAPE
+    x = np.arange(12)
+    width = 0.35
+   
+    bars = ax3.bar(x - width/2, monthly_errors_df['MAPE'], width,
+                   label='MAPE (%)', color='orange', alpha=0.7, edgecolor='darkorange')
+    ax3.set_xlabel('Month', fontsize=11)
+    ax3.set_ylabel('MAPE (%)', color='orange', fontsize=11)
+    ax3.tick_params(axis='y', labelcolor='orange')
+    ax3.set_xticks(x)
+    ax3.set_xticklabels(months_short)
+   
+    # Line for MBE
+    ax3_twin = ax3.twinx()
+    line_mbe = ax3_twin.plot(x, monthly_errors_df['MBE'], 'b-o', linewidth=2.5,
+                              markersize=6, label='MBE (kWh)', color='blue')
+    ax3_twin.set_ylabel('MBE (kWh)', color='blue', fontsize=11)
+    ax3_twin.tick_params(axis='y', labelcolor='blue')
+    ax3_twin.axhline(y=0, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
+   
+    ax3.set_title('Monthly Error Metrics: MAPE and MBE', fontsize=12, fontweight='bold')
+    ax3.grid(True, alpha=0.3, axis='x')
+   
+    # Combined legend for third plot
+    lines1, labels1 = ax3.get_legend_handles_labels()
+    lines2, labels2 = ax3_twin.get_legend_handles_labels()
+    ax3.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+   
+    # Add value labels on MAPE bars
+    for i, (bar, mape_val) in enumerate(zip(bars, monthly_errors_df['MAPE'])):
+        height = bar.get_height()
+        ax3.text(bar.get_x() + bar.get_width()/2., height + 0.5,
+                f'{mape_val:.1f}%', ha='center', va='bottom', fontsize=8)
+   
+    plt.tight_layout()
+    plt.savefig('pv_analysis_plots.png', dpi=150, bbox_inches='tight')
+    plt.show()
+   
+    print("\n[INFO] Plots saved as 'pv_analysis_plots.png'")
+
+
+def export_to_excel(daily, monthly, metrics, filename='production_pv_dublin.xlsx'):
+    """Esporta i risultati in file Excel con più fogli"""
+   
+    print(f"\n[3/3] Exporting data to Excel...")
+   
+    with pd.ExcelWriter(filename, engine='openpyxl') as writer:
+        # Sheet 1: Daily data
+        daily_export = daily[['data_str', 'giorno', 'mese', 'prod_mio', 'prod_pvgis',
+                              'errore_kwh', 'errore_perc', 'temp_ambiente_media_c',
+                              'temp_cella_media_c', 'eff_pannello_perc', 'eff_sistema_perc']].copy()
+        daily_export.columns = ['Date (Month-Day)', 'Day', 'Month', 'Model_Prod_kWh',
+                                'PVGIS_Prod_kWh', 'Error_kWh', 'Error_%',
+                                'Ambient_Temp_°C', 'Cell_Temp_°C',
+                                'Panel_Efficiency_%', 'System_Efficiency_%']
+        daily_export.to_excel(writer, sheet_name='Daily_Data', index=False)
+       
+        # Sheet 2: Monthly data
+        monthly_export = monthly.reset_index()
+        months_names = ['January', 'February', 'March', 'April', 'May', 'June',
+                       'July', 'August', 'September', 'October', 'November', 'December']
+        monthly_export['Month'] = months_names
+        monthly_export = monthly_export[['Month', 'prod_mio', 'prod_pvgis', 'errore_kwh', 'errore_perc',
+                                         'temp_ambiente_media_c', 'temp_cella_media_c',
+                                         'eff_pannello_perc', 'eff_sistema_perc']]
+        monthly_export.columns = ['Month', 'Model_Prod_kWh', 'PVGIS_Prod_kWh', 'Error_kWh', 'Error_%',
+                                  'Avg_Ambient_Temp_°C', 'Avg_Cell_Temp_°C',
+                                  'Avg_Panel_Efficiency_%', 'Avg_System_Efficiency_%']
+        monthly_export.to_excel(writer, sheet_name='Monthly_Data', index=False)
+       
+        # Sheet 3: Annual metrics
+        metrics_annual_df = pd.DataFrame(list(metrics['Annual'].items()), columns=['Metric', 'Value'])
+        metrics_annual_df.to_excel(writer, sheet_name='Annual_Metrics', index=False)
+       
+        # Sheet 4: Monthly metrics
+        metrics['Monthly'].to_excel(writer, sheet_name='Monthly_Metrics', index=False)
+       
+        # Sheet 5: System configuration
+        config_data = {
+            'Parameter': [
+                'Installed Power (kWp)',
+                'Latitude',
+                'Longitude',
+                'Tilt Angle',
+                'Azimuth',
+                'Number of Panels',
+                'Total Area (m²)',
+                'Panel Efficiency STC',
+                'Performance Ratio (PR)',
+                'Inverter Efficiency',
+                'PVGIS Data Period',
+                'Calendar Year',
+                'Data Type',
+                'Important Note'
+            ],
+            'Value': [
+                round(5 * 0.435, 2),
+                53.383,
+                -6.592,
+                30,
+                180,
+                5,
+                round(1.762*1.134*5, 2),
+                '21.8%',
+                '94%',
+                '96%',
+                '2005-2020',
+                '2015 (calendar only)',
+                'TMY - Typical Meteorological Year',
+                'Values are climatological averages for 2005-2020, not actual 2015 data'
+            ]
+        }
+        config_df = pd.DataFrame(config_data)
+        config_df.to_excel(writer, sheet_name='System_Configuration', index=False)
+   
+    print(f"      File saved: {filename}")
+    print(f"      NOTE: Data represents a TYPICAL METEOROLOGICAL YEAR (2005-2020 averages)")
+    print(f"      Dates are for calendar reference only (month-day)")
+
+
+def main():
+    # Coordinates
+    latitude = 53.383
+    longitude = -6.592
+   
+    print("\n" + "="*60)
+    print("PHOTOVOLTAIC PRODUCTION SIMULATION")
+    print("="*60)
+    print("NOTE: Results based on TMY (Typical Meteorological Year) data")
+    print("      i.e., climatological averages for the period 2005-2020")
+    print("="*60)
+   
+    system = PVSystem(latitude, longitude)
+    data = build_tmy_from_multiyear(system)
+    daily = calculate_daily_data(system, data)
+    monthly = print_report(daily)
+    metrics = calculate_metrics(daily)
+    export_to_excel(daily, monthly, metrics, 'production_pv_dublin.xlsx')
+    create_plots(daily, monthly)
+   
+    print("\n" + "="*60)
+    print("SIMULATION COMPLETED!")
+    print("="*60)
+
+
+if __name__ == "__main__":
+    main()
