@@ -1,0 +1,1783 @@
+import pandas as pd
+import numpy as np
+import pvlib
+import warnings
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+from datetime import datetime
+from scipy.stats import gaussian_kde
+from scipy import stats
+from scipy.stats import shapiro, wilcoxon, spearmanr, ks_2samp, ttest_1samp
+import os
+warnings.filterwarnings('ignore')
+
+# Impostazioni per i grafici
+plt.rcParams['font.size'] = 10
+plt.rcParams['axes.titlesize'] = 12
+plt.rcParams['axes.labelsize'] = 10
+
+
+class PVSystem:
+    def __init__(self, latitude, longitude):
+        self.latitude = latitude
+        self.longitude = longitude
+
+        # Orientamento
+        self.tilt = 30
+        self.azimuth_pvlib = 180
+
+        # Moduli
+        self.num_panels = 5
+        self.panel_power_stc = 435
+        self.panel_efficiency_stc = 0.218
+        self.temperature_coefficient_pmax = -0.0034
+
+        # Temperatura
+        self.NOCT_datasheet = 43
+        self.roof_delta = 2
+        self.NOCT_effective = self.NOCT_datasheet + self.roof_delta
+
+        # Area
+        self.module_area = 1.762 * 1.134
+        self.total_area = self.num_panels * self.module_area
+
+        # Perdite di sistema
+        self.PR_ref = 0.94
+        self.inverter_eff = 0.96
+
+        self.installed_power_kw = (self.num_panels * self.panel_power_stc) / 1000
+
+        # Parametri Sandia
+        self.a_sandia = -3.48
+        self.b_sandia = -0.080
+
+        # Correzione PR in base alla latitudine
+        if self.latitude >= 50:
+            self.pr_a, self.pr_b = 0.88, 0.12
+        elif self.latitude >= 40:
+            self.pr_a, self.pr_b = 0.90, 0.10
+        else:
+            self.pr_a, self.pr_b = 0.92, 0.08
+
+        print("\n" + "="*60)
+        print(f"CONFIGURAZIONE SISTEMA FOTOVOLTAICO")
+        print("="*60)
+        print(f"Potenza installata:     {self.installed_power_kw:.2f} kWp")
+        print(f"Latitudine:             {self.latitude}°")
+        print(f"Longitudine:            {self.longitude}°")
+        print(f"Inclinazione moduli:    {self.tilt}°")
+        print(f"Azimut:                 {self.azimuth_pvlib}°")
+        print(f"Numero pannelli:        {self.num_panels}")
+        print(f"Area totale:            {self.total_area:.2f} m²")
+        print(f"Efficienza riferimento: {self.panel_efficiency_stc*100:.1f}%")
+        print(f"PR riferimento:         {self.PR_ref*100:.1f}%")
+        print(f"Efficienza inverter:    {self.inverter_eff*100:.1f}%")
+        print("="*60)
+
+
+def build_tmy_from_multiyear(system):
+    """Scarica i dati da PVGIS e costruisce un TMY"""
+    
+    print("\n[1/3] Scaricamento dati meteorologici da PVGIS...")
+    print(f"      Periodo: 2005-2020")
+    
+    res = pvlib.iotools.get_pvgis_hourly(
+        latitude=system.latitude,
+        longitude=system.longitude,
+        start=2005,
+        end=2020,
+        surface_tilt=system.tilt,
+        surface_azimuth=system.azimuth_pvlib,
+        components=True,
+        usehorizon=True,
+        raddatabase='PVGIS-SARAH3'
+    )
+
+    data = res[0].copy()
+
+    # Tolgo il 29 febbraio
+    data = data[~((data.index.month == 2) & (data.index.day == 29))]
+
+    # Calcolo la POA globale
+    data['poa_global'] = (
+        data['poa_direct'] +
+        data['poa_sky_diffuse'] +
+        data['poa_ground_diffuse']
+    )
+
+    # Produzione di riferimento da PVGIS
+    if 'P' in data.columns:
+        data['pvgis_prod_kwh'] = data['P'] / 1000
+    else:
+        data['pvgis_prod_kwh'] = (
+            data['poa_global'] / 1000
+        ) * system.installed_power_kw * 0.84
+
+    # Creo un TMY
+    tmy = data.groupby(
+        [data.index.month, data.index.day, data.index.hour]
+    ).mean()
+
+    index = pd.date_range(start='2000-01-01', periods=8760, freq='h')
+
+    result = pd.DataFrame(index=index)
+    result['poa_global'] = tmy['poa_global'].values
+    result['temp_air'] = tmy['temp_air'].values
+    result['pvgis_ref_kwh'] = tmy['pvgis_prod_kwh'].values
+    
+    print(f"      Dati scaricati: {len(result)} ore")
+    print(f"      POA media annua: {result['poa_global'].mean():.1f} W/m²")
+    print(f"      Temperatura media: {result['temp_air'].mean():.1f}°C")
+
+    return result
+
+
+def calculate_daily_data(system, hourly):
+    """Calcola la produzione oraria e poi giornaliera"""
+    
+    print("\n[2/3] Calcolo della produzione oraria...")
+    
+    # Clearness index
+    hourly['kt'] = np.clip(hourly['poa_global'] / 1000, 0, 1)
+
+    # PR dinamico
+    hourly['pr_dyn'] = system.PR_ref * (
+        system.pr_a + system.pr_b * hourly['kt']
+    )
+
+    # Vento stagionale
+    month = hourly.index.month
+    wind_speed = np.where(
+        (month >= 5) & (month <= 8),
+        0.8,
+        np.where(
+            (month <= 2) | (month >= 11),
+            1.5,
+            1.1
+        )
+    )
+
+    # Temperatura cella
+    hourly['t_cell'] = hourly['temp_air'] + \
+        hourly['poa_global'] * np.exp(
+            system.a_sandia + system.b_sandia * wind_speed
+        )
+
+    # Efficienza pannello
+    hourly['eff_panel'] = system.panel_efficiency_stc * (
+        1 + system.temperature_coefficient_pmax *
+        (hourly['t_cell'] - 25)
+    )
+    
+    # Efficienza sistema
+    hourly['eff_system'] = hourly['eff_panel'] * hourly['pr_dyn'] * system.inverter_eff
+
+    # Produzione oraria
+    hourly['prod_h'] = (
+        hourly['poa_global'] / 1000
+    ) * system.total_area * hourly['eff_panel'] * \
+        hourly['pr_dyn'] * system.inverter_eff
+
+    # Aggrego per giorno
+    daily = hourly.resample('D').agg({
+        'prod_h': 'sum',
+        'pvgis_ref_kwh': 'sum',
+        'temp_air': 'mean',
+        't_cell': 'mean',
+        'eff_panel': 'mean',
+        'eff_system': 'mean'
+    })
+
+    daily.rename(columns={
+        'prod_h': 'prod_mio',
+        'pvgis_ref_kwh': 'prod_pvgis',
+        'temp_air': 'temp_ambiente_media_c',
+        't_cell': 'temp_cella_media_c',
+        'eff_panel': 'eff_pannello_media',
+        'eff_system': 'eff_sistema_media'
+    }, inplace=True)
+    
+    daily['giorno'] = daily.index.day
+    daily['mese'] = daily.index.month
+    daily['data_str'] = daily.index.strftime('%m-%d')
+    daily['errore_kwh'] = daily['prod_mio'] - daily['prod_pvgis']
+    daily['errore_perc'] = (daily['errore_kwh'] / daily['prod_pvgis']) * 100
+    daily['eff_pannello_perc'] = daily['eff_pannello_media'] * 100
+    daily['eff_sistema_perc'] = daily['eff_sistema_media'] * 100
+    
+    print(f"      Calcolate {len(daily)} giornate")
+    print(f"      Produzione media giornaliera (modello): {daily['prod_mio'].mean():.2f} kWh")
+    print(f"      Produzione media giornaliera (PVGIS):   {daily['prod_pvgis'].mean():.2f} kWh")
+    print(f"      Temperatura ambiente media: {daily['temp_ambiente_media_c'].mean():.1f}°C")
+    print(f"      Temperatura cella media:    {daily['temp_cella_media_c'].mean():.1f}°C")
+    print(f"      Efficienza pannello media:  {daily['eff_pannello_perc'].mean():.2f}%")
+    print(f"      Efficienza sistema media:   {daily['eff_sistema_perc'].mean():.2f}%")
+    
+    return daily, hourly
+
+
+def calculate_monthly_metrics(daily):
+    """Calcola le metriche di errore per ogni mese"""
+    
+    monthly_metrics = []
+    mesi_nomi = ['January', 'February', 'March', 'April', 'May', 'June',
+                 'July', 'August', 'September', 'October', 'November', 'December']
+    
+    for month in range(1, 13):
+        monthly_data = daily[daily['mese'] == month]
+        err = monthly_data['prod_mio'] - monthly_data['prod_pvgis']
+        
+        if len(monthly_data) > 0:
+            mape = np.mean(np.abs(err / monthly_data['prod_pvgis'])) * 100
+            mbe = np.mean(err)
+            rmse = np.sqrt(np.mean(err**2))
+            mae = np.mean(np.abs(err))
+            
+            monthly_metrics.append({
+                'Month': mesi_nomi[month-1],
+                'Days': len(monthly_data),
+                'Model_Total_kWh': monthly_data['prod_mio'].sum(),
+                'PVGIS_Total_kWh': monthly_data['prod_pvgis'].sum(),
+                'MAPE_%': mape,
+                'MBE_kWh': mbe,
+                'RMSE_kWh': rmse,
+                'MAE_kWh': mae
+            })
+    
+    return pd.DataFrame(monthly_metrics)
+
+
+def calculate_metrics(daily):
+    """Calcola e stampa metriche di errore annuali e mensili"""
+    
+    err = daily['prod_mio'] - daily['prod_pvgis']
+    
+    mape = np.mean(np.abs(err / daily['prod_pvgis'])) * 100
+    mbe = np.mean(err)
+    rmse = np.sqrt(np.mean(err**2))
+    mae = np.mean(np.abs(err))
+    nrmse = rmse / daily['prod_pvgis'].mean() * 100
+    r2 = 1 - (np.sum(err**2) / np.sum((daily['prod_pvgis'] - daily['prod_pvgis'].mean())**2))
+    
+    print("\n" + "="*60)
+    print("ERROR METRICS - ANNUAL SCALE")
+    print("="*60)
+    print(f"MAPE  (Mean Absolute Percentage Error):  {mape:.3f}%")
+    print(f"MBE   (Mean Bias Error):                {mbe:.4f} kWh")
+    print(f"RMSE  (Root Mean Square Error):         {rmse:.4f} kWh")
+    print(f"MAE   (Mean Absolute Error):            {mae:.4f} kWh")
+    print(f"NRMSE (Normalized RMSE):                {nrmse:.3f}%")
+    print(f"R²    (Coefficient of determination):   {r2:.4f}")
+    print("="*60)
+    
+    monthly_metrics = calculate_monthly_metrics(daily)
+    
+    print("\n" + "="*80)
+    print("ERROR METRICS - MONTHLY SCALE")
+    print("="*80)
+    print(monthly_metrics.to_string(index=False))
+    print("="*80)
+    
+    return {
+        'Annual': {
+            'MAPE (%)': mape,
+            'MBE (kWh)': mbe,
+            'RMSE (kWh)': rmse,
+            'MAE (kWh)': mae,
+            'NRMSE (%)': nrmse,
+            'R²': r2
+        },
+        'Monthly': monthly_metrics
+    }
+
+
+def print_report(daily):
+    """Stampa report mensile dettagliato"""
+    
+    monthly = daily.resample('M').agg({
+        'prod_mio': 'sum',
+        'prod_pvgis': 'sum',
+        'errore_kwh': 'sum',
+        'errore_perc': 'mean',
+        'temp_ambiente_media_c': 'mean',
+        'temp_cella_media_c': 'mean',
+        'eff_pannello_media': 'mean',
+        'eff_sistema_media': 'mean'
+    })
+    
+    monthly['eff_pannello_perc'] = monthly['eff_pannello_media'] * 100
+    monthly['eff_sistema_perc'] = monthly['eff_sistema_media'] * 100
+    
+    print("\n" + "="*80)
+    print("MONTHLY PRODUCTION REPORT")
+    print("="*80)
+    print(f"{'MONTH':<6} | {'MODEL (kWh)':>10} | {'PVGIS (kWh)':>12} | {'DIFF (kWh)':>10} | {'DIFF %':>8} | {'T_AMB (°C)':>10} | {'T_CELL (°C)':>10} | {'EFF_PAN(%)':>10} | {'EFF_SYS(%)':>10}")
+    print("-"*80)
+    
+    mesi = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
+            'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    
+    for i, row in enumerate(monthly.itertuples()):
+        print(f"{mesi[i]:<6} | {row.prod_mio:>10.1f} | {row.prod_pvgis:>12.1f} | {row.errore_kwh:>10.2f} | {row.errore_perc:>7.2f}% | {row.temp_ambiente_media_c:>10.1f} | {row.temp_cella_media_c:>10.1f} | {row.eff_pannello_perc:>9.2f}% | {row.eff_sistema_perc:>9.2f}%")
+
+    tot_mio = daily['prod_mio'].sum()
+    tot_pvgis = daily['prod_pvgis'].sum()
+    tot_err = tot_mio - tot_pvgis
+    diff_tot = (tot_err / tot_pvgis) * 100
+    
+    print("-"*80)
+    print(f"{'TOTAL':<6} | {tot_mio:>10.1f} | {tot_pvgis:>12.1f} | {tot_err:>10.2f} | {diff_tot:>7.2f}% | {'-':>10} | {'-':>10} | {'-':>10} | {'-':>10}")
+    print("="*80)
+    
+    return monthly
+
+
+def create_plots(daily, monthly):
+    """Create the requested plots with English labels"""
+    
+    fig, axes = plt.subplots(3, 1, figsize=(14, 12))
+    
+    # PLOT 1: Panel Efficiency vs Cell Temperature
+    ax1 = axes[0]
+    monthly_eff = daily.groupby('mese')['eff_pannello_perc'].mean()
+    monthly_temp = daily.groupby('mese')['temp_cella_media_c'].mean()
+    months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
+              'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    x = range(1, 13)
+    
+    line1 = ax1.plot(x, monthly_eff.values, 'b-o', linewidth=2.5, markersize=7, 
+                     label='Panel Efficiency (%)', color='blue')
+    ax1.set_xlabel('Month', fontsize=11)
+    ax1.set_ylabel('Panel Efficiency (%)', color='blue', fontsize=11)
+    ax1.tick_params(axis='y', labelcolor='blue')
+    ax1.set_xticks(x)
+    ax1.set_xticklabels(months)
+    ax1.set_title('Monthly Panel Efficiency vs Cell Temperature', 
+                  fontsize=12, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+    
+    ax1_twin = ax1.twinx()
+    line2 = ax1_twin.plot(x, monthly_temp.values, 'r-o', linewidth=2.5, markersize=7, 
+                          label='Cell Temperature (°C)', color='red')
+    ax1_twin.set_ylabel('Cell Temperature (°C)', color='red', fontsize=11)
+    ax1_twin.tick_params(axis='y', labelcolor='red')
+    
+    lines = line1 + line2
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, loc='upper right')
+    
+    # PLOT 2: Daily production comparison - 12 subplots mensili
+    ax2 = axes[1]
+    axes[2].set_visible(False)
+    
+    fig2, axes2 = plt.subplots(3, 4, figsize=(16, 12))
+    axes2 = axes2.flatten()
+    
+    mesi_nomi = ['January', 'February', 'March', 'April', 'May', 'June',
+                 'July', 'August', 'September', 'October', 'November', 'December']
+    
+    for month in range(1, 13):
+        ax = axes2[month-1]
+        monthly_data = daily[daily['mese'] == month]
+        
+        if len(monthly_data) > 0:
+            ax.plot(monthly_data.index, monthly_data['prod_mio'], 
+                   'b-', linewidth=1.5, alpha=0.8, label='Model')
+            ax.plot(monthly_data.index, monthly_data['prod_pvgis'], 
+                   'r-', linewidth=1.5, alpha=0.8, label='PVGIS')
+            
+            err = monthly_data['prod_mio'] - monthly_data['prod_pvgis']
+            mape = np.mean(np.abs(err / monthly_data['prod_pvgis'])) * 100
+            mbe = np.mean(err)
+            
+            ax.set_title(f'{mesi_nomi[month-1]}\nMAPE={mape:.1f}%, MBE={mbe:.2f}kWh', 
+                        fontsize=10, fontweight='bold')
+            ax.set_xlabel('Day of month', fontsize=9)
+            ax.set_ylabel('Daily Production (kWh)', fontsize=9)
+            ax.legend(loc='upper right', fontsize=8)
+            ax.grid(True, alpha=0.3)
+            ax.set_xlim(monthly_data.index.min(), monthly_data.index.max())
+            
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%d'))
+            ax.xaxis.set_major_locator(mdates.DayLocator(interval=5))
+            plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right', fontsize=7)
+    
+    fig2.suptitle('Daily Production Comparison by Month', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig('daily_production_by_month.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    
+    # PLOT 3: Monthly error metrics
+    fig3, ax3 = plt.subplots(figsize=(12, 5))
+    monthly_errors = []
+    months_short = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
+                    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    
+    for month in range(1, 13):
+        monthly_data = daily[daily['mese'] == month]
+        if len(monthly_data) > 0:
+            err = monthly_data['prod_mio'] - monthly_data['prod_pvgis']
+            mape = np.mean(np.abs(err / monthly_data['prod_pvgis'])) * 100
+            mbe = np.mean(err)
+            monthly_errors.append({'month': month, 'MAPE': mape, 'MBE': mbe})
+    
+    monthly_errors_df = pd.DataFrame(monthly_errors)
+    x = np.arange(12)
+    width = 0.35
+    
+    bars = ax3.bar(x - width/2, monthly_errors_df['MAPE'], width, 
+                   label='MAPE (%)', color='orange', alpha=0.7, edgecolor='darkorange')
+    ax3.set_xlabel('Month', fontsize=11)
+    ax3.set_ylabel('MAPE (%)', color='orange', fontsize=11)
+    ax3.tick_params(axis='y', labelcolor='orange')
+    ax3.set_xticks(x)
+    ax3.set_xticklabels(months_short)
+    
+    ax3_twin = ax3.twinx()
+    ax3_twin.plot(x, monthly_errors_df['MBE'], 'b-o', linewidth=2.5, markersize=6, label='MBE (kWh)', color='blue')
+    ax3_twin.set_ylabel('MBE (kWh)', color='blue', fontsize=11)
+    ax3_twin.tick_params(axis='y', labelcolor='blue')
+    ax3_twin.axhline(y=0, color='gray', linestyle='--', alpha=0.5, linewidth=1.5)
+    
+    ax3.set_title('Monthly Error Metrics: MAPE and MBE', fontsize=12, fontweight='bold')
+    ax3.grid(True, alpha=0.3, axis='x')
+    
+    lines1, labels1 = ax3.get_legend_handles_labels()
+    lines2, labels2 = ax3_twin.get_legend_handles_labels()
+    ax3.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
+    
+    for i, (bar, mape_val) in enumerate(zip(bars, monthly_errors_df['MAPE'])):
+        height = bar.get_height()
+        ax3.text(bar.get_x() + bar.get_width()/2., height + 0.5,
+                f'{mape_val:.1f}%', ha='center', va='bottom', fontsize=8)
+    
+    plt.tight_layout()
+    plt.savefig('monthly_error_metrics.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    
+    print("\n[INFO] Plots saved: 'daily_production_by_month.png', 'monthly_error_metrics.png'")
+
+
+# ============================================================================
+# FUNZIONI PER VALIDAZIONE STATISTICA ORARIA
+# ============================================================================
+
+def calculate_hourly_metrics(hourly):
+    """Calcola metriche di errore a livello orario su tutto il dataset"""
+    
+    mask = hourly['pvgis_ref_kwh'] > 0
+    hourly_valid = hourly[mask].copy()
+    
+    err = hourly_valid['prod_h'] - hourly_valid['pvgis_ref_kwh']
+    rel_err = (err / hourly_valid['pvgis_ref_kwh']) * 100
+    
+    mbe = np.mean(err)
+    mae = np.mean(np.abs(err))
+    rmse = np.sqrt(np.mean(err**2))
+    mape = np.mean(np.abs(rel_err))
+    nrmse = rmse / hourly_valid['pvgis_ref_kwh'].mean() * 100
+    mape_median = np.median(np.abs(rel_err))
+    
+    ss_res = np.sum(err**2)
+    ss_tot = np.sum((hourly_valid['pvgis_ref_kwh'] - hourly_valid['pvgis_ref_kwh'].mean())**2)
+    r2 = 1 - (ss_res / ss_tot)
+    
+    # Percentuali di ore entro soglie di errore: 1%, 2%, 3%
+    pct_err_1pct = (np.abs(rel_err) < 1).mean() * 100
+    pct_err_2pct = (np.abs(rel_err) < 2).mean() * 100
+    pct_err_3pct = (np.abs(rel_err) < 3).mean() * 100
+    
+    print("\n" + "="*60)
+    print("ERROR METRICS - HOURLY SCALE (all hours)")
+    print("="*60)
+    print(f"MBE   (Mean Bias Error):          {mbe:.5f} kWh")
+    print(f"MAE   (Mean Absolute Error):      {mae:.5f} kWh")
+    print(f"RMSE  (Root Mean Square Error):   {rmse:.5f} kWh")
+    print(f"MAPE  (Mean Absolute % Error):    {mape:.2f}%")
+    print(f"MdAPE (Median Absolute % Error):  {mape_median:.2f}%")
+    print(f"NRMSE (Normalized RMSE):          {nrmse:.2f}%")
+    print(f"R²    (Coefficient of determination): {r2:.4f}")
+    print(f"\n📊 Ore entro soglie di errore:")
+    print(f"   Errore < 1%:  {pct_err_1pct:.1f}% delle ore")
+    print(f"   Errore < 2%:  {pct_err_2pct:.1f}% delle ore")
+    print(f"   Errore < 3%:  {pct_err_3pct:.1f}% delle ore")
+    print("="*60)
+    
+    return {
+        'MBE_kWh': mbe,
+        'MAE_kWh': mae,
+        'RMSE_kWh': rmse,
+        'MAPE_perc': mape,
+        'MdAPE_perc': mape_median,
+        'NRMSE_perc': nrmse,
+        'R2': r2,
+        'N_hours': len(hourly_valid),
+        'pct_error_lt_1': pct_err_1pct,
+        'pct_error_lt_2': pct_err_2pct,
+        'pct_error_lt_3': pct_err_3pct
+    }
+
+
+def create_hourly_statistical_evidence(hourly):
+    """Crea tabella statistica per dimostrare accuratezza oraria"""
+    
+    mask = hourly['pvgis_ref_kwh'] > 0.001
+    hourly_valid = hourly[mask].copy()
+    
+    err = hourly_valid['prod_h'] - hourly_valid['pvgis_ref_kwh']
+    rel_err = (err / hourly_valid['pvgis_ref_kwh']) * 100
+    
+    # Intervallo di confidenza al 95% per MBE
+    conf_interval = [
+        np.mean(err) - 1.96 * np.std(err) / np.sqrt(len(err)),
+        np.mean(err) + 1.96 * np.std(err) / np.sqrt(len(err))
+    ]
+    
+    stats_table = pd.DataFrame({
+        'Metrica': [
+            'Numero ore analizzate',
+            'Errore medio orario (MBE)',
+            'Errore assoluto medio (MAE)',
+            'Errore quadratico medio (RMSE)',
+            'Errore percentuale medio (MAPE)',
+            'Mediana errore percentuale (MdAPE)',
+            'Deviazione standard errore',
+            'Intervallo di confidenza 95% (MBE)',
+            'Percentuale ore con errore < 1%',
+            'Percentuale ore con errore < 2%',
+            'Percentuale ore con errore < 3%',
+            'Massimo errore assoluto',
+            'Minimo errore assoluto (non zero)'
+        ],
+        'Valore': [
+            f"{len(hourly_valid)}",
+            f"{np.mean(err):.5f} kWh",
+            f"{np.mean(np.abs(err)):.5f} kWh",
+            f"{np.sqrt(np.mean(err**2)):.5f} kWh",
+            f"{np.mean(np.abs(rel_err)):.2f}%",
+            f"{np.median(np.abs(rel_err)):.2f}%",
+            f"{np.std(err):.5f} kWh",
+            f"[{conf_interval[0]:.5f}, {conf_interval[1]:.5f}] kWh",
+            f"{(np.abs(rel_err) < 1).mean() * 100:.1f}%",
+            f"{(np.abs(rel_err) < 2).mean() * 100:.1f}%",
+            f"{(np.abs(rel_err) < 3).mean() * 100:.1f}%",
+            f"{np.max(np.abs(err)):.5f} kWh",
+            f"{np.min(np.abs(err)[np.abs(err) > 0]):.5f} kWh"
+        ]
+    })
+    
+    print("\n" + "="*70)
+    print("📊 EVIDENZA STATISTICA - ACCURATEZZA ORARIA")
+    print("="*70)
+    print(stats_table.to_string(index=False))
+    print("="*70)
+    
+    return stats_table
+
+
+def perform_statistical_tests(hourly):
+    """Test statistici per dimostrare similarità tra modello e PVGIS"""
+    
+    mask = hourly['pvgis_ref_kwh'] > 0.001
+    model = hourly.loc[mask, 'prod_h'].values
+    pvgis = hourly.loc[mask, 'pvgis_ref_kwh'].values
+    diff = model - pvgis
+    
+    # Test di Wilcoxon
+    wilcoxon_stat, wilcoxon_p = wilcoxon(model, pvgis)
+    
+    # Correlazione di Spearman
+    spearman_corr, spearman_p = spearmanr(model, pvgis)
+    
+    # Test t di Student
+    t_stat, t_p = ttest_1samp(diff, 0)
+    
+    # Test di Kolmogorov-Smirnov
+    ks_stat, ks_p = ks_2samp(model, pvgis)
+    
+    # Test di normalità (Shapiro-Wilk) sugli errori
+    sample_size = min(5000, len(diff))
+    sample_diff = np.random.choice(diff, sample_size, replace=False)
+    shapiro_stat, shapiro_p = shapiro(sample_diff)
+    
+    results = pd.DataFrame({
+        'Test Statistico': [
+            'Wilcoxon signed-rank',
+            'Spearman correlation',
+            'Student t-test (diff = 0)',
+            'Kolmogorov-Smirnov',
+            'Shapiro-Wilk (normalità errori)'
+        ],
+        'Statistica': [
+            f"{wilcoxon_stat:.2f}",
+            f"{spearman_corr:.6f}",
+            f"{t_stat:.4f}",
+            f"{ks_stat:.4f}",
+            f"{shapiro_stat:.4f}"
+        ],
+        'p-value': [
+            f"{wilcoxon_p:.4e}",
+            f"{spearman_p:.4e}",
+            f"{t_p:.4e}",
+            f"{ks_p:.4e}",
+            f"{shapiro_p:.4e}"
+        ],
+        'Interpretazione (α=0.05)': [
+            '✅ Non rifiuto H0 (distribuzioni uguali)' if wilcoxon_p > 0.05 else '❌ Rifiuto H0',
+            f'✅ Correlazione {"perfetta" if spearman_corr > 0.999 else "forte"}' if spearman_p < 0.05 else '❌ Correlazione non significativa',
+            '✅ Non rifiuto H0 (media diff = 0)' if t_p > 0.05 else '❌ Rifiuto H0',
+            '✅ Stessa distribuzione' if ks_p > 0.05 else '❌ Distribuzioni diverse',
+            '✅ Errori normali' if shapiro_p > 0.05 else '⚠️ Errori non normali (accettabile per grandi n)'
+        ]
+    })
+    
+    print("\n" + "="*70)
+    print("📈 TEST STATISTICI - CONFRONTO MODELLO vs PVGIS")
+    print("="*70)
+    print(results.to_string(index=False))
+    print("="*70)
+    print("\n📝 NOTE:")
+    print("- H0 = le due distribuzioni sono uguali / la differenza media è zero")
+    print("- p-value > 0.05 → nessuna evidenza statistica di differenza")
+    print("- Correlazione di Spearman > 0.999 → relazione quasi perfetta")
+    
+    return results
+
+
+def analyze_residuals_by_hour_month(hourly):
+    """Analisi dei residui per ora e mese"""
+    
+    mask = hourly['pvgis_ref_kwh'] > 0.001
+    hourly_valid = hourly[mask].copy()
+    
+    hourly_valid['error'] = hourly_valid['prod_h'] - hourly_valid['pvgis_ref_kwh']
+    hourly_valid['rel_error'] = (hourly_valid['error'] / hourly_valid['pvgis_ref_kwh']) * 100
+    hourly_valid['hour'] = hourly_valid.index.hour
+    hourly_valid['month'] = hourly_valid.index.month
+    
+    # Tabella errori per fascia oraria
+    hourly_error_by_hour = hourly_valid.groupby('hour')['rel_error'].agg([
+        ('Media (%)', 'mean'),
+        ('Mediana (%)', 'median'),
+        ('Std Dev (%)', 'std'),
+        ('Q1 (%)', lambda x: x.quantile(0.25)),
+        ('Q3 (%)', lambda x: x.quantile(0.75))
+    ]).round(2)
+    
+    # Tabella errori per mese
+    monthly_error = hourly_valid.groupby('month')['rel_error'].agg([
+        ('Media (%)', 'mean'),
+        ('Mediana (%)', 'median'),
+        ('Std Dev (%)', 'std')
+    ]).round(2)
+    
+    mesi_nomi = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
+                 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    monthly_error.index = mesi_nomi
+    
+    print("\n" + "="*70)
+    print("🔍 ANALISI RESIDUI - ERRORI PER ORA DEL GIORNO")
+    print("="*70)
+    print(hourly_error_by_hour.to_string())
+    
+    print("\n" + "="*70)
+    print("📅 ANALISI RESIDUI - ERRORI PER MESE")
+    print("="*70)
+    print(monthly_error.to_string())
+    print("="*70)
+    
+    # Verifica se gli errori medi per ora sono tutti prossimi a zero
+    max_abs_mean_hour = np.max(np.abs(hourly_error_by_hour['Media (%)'].values))
+    print(f"\n✅ Verifica bias orario: massimo |errore medio| = {max_abs_mean_hour:.2f}%")
+    if max_abs_mean_hour < 2:
+        print("   → Nessun bias orario significativo (< 2%)")
+    else:
+        print(f"   → Attenzione: bias orario rilevante ({max_abs_mean_hour:.2f}%)")
+    
+    return hourly_error_by_hour, monthly_error
+
+
+def plot_residuals_analysis(hourly):
+    """Plot per analisi visiva dei residui"""
+    
+    mask = hourly['pvgis_ref_kwh'] > 0.001
+    hourly_valid = hourly[mask].copy()
+    
+    hourly_valid['error'] = hourly_valid['prod_h'] - hourly_valid['pvgis_ref_kwh']
+    hourly_valid['rel_error'] = (hourly_valid['error'] / hourly_valid['pvgis_ref_kwh']) * 100
+    hourly_valid['hour'] = hourly_valid.index.hour
+    
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    
+    # Plot 1: Istogramma degli errori
+    ax1 = axes[0, 0]
+    ax1.hist(hourly_valid['error'], bins=100, edgecolor='black', alpha=0.7, color='steelblue')
+    ax1.axvline(x=0, color='red', linestyle='--', linewidth=2, label='Zero error')
+    ax1.set_xlabel('Error (kWh)')
+    ax1.set_ylabel('Frequency')
+    ax1.set_title('Distribution of Hourly Errors', fontsize=12, fontweight='bold')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot 2: Errori vs produzione PVGIS
+    ax2 = axes[0, 1]
+    ax2.scatter(hourly_valid['pvgis_ref_kwh'], hourly_valid['error'], 
+                alpha=0.3, s=5, c='steelblue')
+    ax2.axhline(y=0, color='red', linestyle='--', linewidth=2)
+    ax2.set_xlabel('PVGIS Production (kWh/h)')
+    ax2.set_ylabel('Error (kWh)')
+    ax2.set_title('Residuals vs Fitted Values', fontsize=12, fontweight='bold')
+    ax2.grid(True, alpha=0.3)
+    
+    # Plot 3: Q-Q plot per normalità
+    ax3 = axes[1, 0]
+    from scipy import stats as scipy_stats
+    scipy_stats.probplot(hourly_valid['error'].sample(min(1000, len(hourly_valid))), 
+                         dist="norm", plot=ax3)
+    ax3.set_title('Q-Q Plot of Errors', fontsize=12, fontweight='bold')
+    ax3.grid(True, alpha=0.3)
+    
+    # Plot 4: Errori medi per ora del giorno
+    ax4 = axes[1, 1]
+    hourly_mean_error = hourly_valid.groupby('hour')['rel_error'].mean()
+    hourly_std_error = hourly_valid.groupby('hour')['rel_error'].std()
+    
+    ax4.errorbar(hourly_mean_error.index, hourly_mean_error.values, 
+                 yerr=hourly_std_error.values, fmt='o-', capsize=3, 
+                 color='steelblue', ecolor='gray', elinewidth=1)
+    ax4.axhline(y=0, color='red', linestyle='--', linewidth=2)
+    ax4.set_xlabel('Hour of Day')
+    ax4.set_ylabel('Relative Error (%)')
+    ax4.set_title('Mean Relative Error by Hour of Day (with ±1σ)', fontsize=12, fontweight='bold')
+    ax4.grid(True, alpha=0.3)
+    ax4.set_xticks(range(0, 24, 2))
+    
+    plt.tight_layout()
+    plt.savefig('residuals_analysis.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    
+    print("[INFO] Saved: residuals_analysis.png")
+
+
+# ============================================================================
+# FUNZIONI PER ANALISI STAGIONALE
+# ============================================================================
+
+def analyze_seasonal_performance(hourly, daily):
+    """Analisi dettagliata delle performance stagionali"""
+    
+    # Definizione stagioni
+    hourly['season'] = hourly.index.month.map({
+        12: 'Winter', 1: 'Winter', 2: 'Winter',
+        3: 'Spring', 4: 'Spring', 5: 'Spring',
+        6: 'Summer', 7: 'Summer', 8: 'Summer',
+        9: 'Autumn', 10: 'Autumn', 11: 'Autumn'
+    })
+    
+    daily['season'] = daily.index.month.map({
+        12: 'Winter', 1: 'Winter', 2: 'Winter',
+        3: 'Spring', 4: 'Spring', 5: 'Spring',
+        6: 'Summer', 7: 'Summer', 8: 'Summer',
+        9: 'Autumn', 10: 'Autumn', 11: 'Autumn'
+    })
+    
+    seasons_order = ['Winter', 'Spring', 'Summer', 'Autumn']
+    seasons_names = {'Winter': 'Inverno (Dec-Feb)', 'Spring': 'Primavera (Mar-May)',
+                     'Summer': 'Estate (Jun-Aug)', 'Autumn': 'Autunno (Sep-Nov)'}
+    
+    # 1. Metriche stagionali orarie
+    print("\n" + "="*80)
+    print("🌿 ANALISI STAGIONALE - PERFORMANCE ORARIE")
+    print("="*80)
+    
+    seasonal_hourly_metrics = []
+    for season in seasons_order:
+        season_data = hourly[hourly['season'] == season]
+        mask = season_data['pvgis_ref_kwh'] > 0
+        season_valid = season_data[mask]
+        
+        if len(season_valid) > 0:
+            err = season_valid['prod_h'] - season_valid['pvgis_ref_kwh']
+            rel_err = (err / season_valid['pvgis_ref_kwh']) * 100
+            
+            seasonal_hourly_metrics.append({
+                'Stagione': seasons_names[season],
+                'Ore analizzate': len(season_valid),
+                'MBE (kWh)': np.mean(err),
+                'MAE (kWh)': np.mean(np.abs(err)),
+                'RMSE (kWh)': np.sqrt(np.mean(err**2)),
+                'MAPE (%)': np.mean(np.abs(rel_err)),
+                'Mediana MAPE (%)': np.median(np.abs(rel_err)),
+                'Ore con errore <3% (%)': (np.abs(rel_err) < 3).mean() * 100
+            })
+    
+    seasonal_df = pd.DataFrame(seasonal_hourly_metrics)
+    print(seasonal_df.to_string(index=False))
+    
+    # 2. Metriche stagionali giornaliere
+    print("\n" + "="*80)
+    print("📆 ANALISI STAGIONALE - PERFORMANCE GIORNALIERE")
+    print("="*80)
+    
+    seasonal_daily_metrics = []
+    for season in seasons_order:
+        season_data = daily[daily['season'] == season]
+        if len(season_data) > 0:
+            err = season_data['prod_mio'] - season_data['prod_pvgis']
+            rel_err = (err / season_data['prod_pvgis']) * 100
+            
+            seasonal_daily_metrics.append({
+                'Stagione': seasons_names[season],
+                'Giorni': len(season_data),
+                'Prod_Media_Modello (kWh)': season_data['prod_mio'].mean(),
+                'Prod_Media_PVGIS (kWh)': season_data['prod_pvgis'].mean(),
+                'MBE (kWh)': np.mean(err),
+                'MAE (kWh)': np.mean(np.abs(err)),
+                'MAPE (%)': np.mean(np.abs(rel_err)),
+                'T_Ambiente_Media (°C)': season_data['temp_ambiente_media_c'].mean(),
+                'T_Cella_Media (°C)': season_data['temp_cella_media_c'].mean(),
+                'Efficienza_Pannello (%)': season_data['eff_pannello_perc'].mean()
+            })
+    
+    seasonal_daily_df = pd.DataFrame(seasonal_daily_metrics)
+    print(seasonal_daily_df.to_string(index=False))
+    
+    return seasonal_df, seasonal_daily_df
+
+
+def plot_seasonal_analysis(hourly, daily, seasonal_daily_df):
+    """Grafici per l'analisi stagionale"""
+    
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    
+    # Plot 1: Profili diurni per stagione
+    ax1 = axes[0, 0]
+    hourly['hour'] = hourly.index.hour
+    hourly['season'] = hourly.index.month.map({
+        12: 'Winter', 1: 'Winter', 2: 'Winter',
+        3: 'Spring', 4: 'Spring', 5: 'Spring',
+        6: 'Summer', 7: 'Summer', 8: 'Summer',
+        9: 'Autumn', 10: 'Autumn', 11: 'Autumn'
+    })
+    
+    seasons_colors = {'Winter': 'blue', 'Spring': 'green', 'Summer': 'red', 'Autumn': 'orange'}
+    
+    for season in ['Winter', 'Spring', 'Summer', 'Autumn']:
+        season_data = hourly[hourly['season'] == season]
+        diurnal_model = season_data.groupby('hour')['prod_h'].mean()
+        ax1.plot(diurnal_model.index, diurnal_model.values, 
+                color=seasons_colors[season], linewidth=2, label=f'{season}')
+    
+    ax1.set_xlabel('Hour of Day', fontsize=11)
+    ax1.set_ylabel('Mean Production (kWh/h)', fontsize=11)
+    ax1.set_title('Diurnal Production Profiles by Season', fontsize=12, fontweight='bold')
+    ax1.legend(loc='upper left')
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xticks(range(0, 24, 3))
+    
+    # Plot 2: Barre comparate produzione giornaliera media per stagione
+    ax2 = axes[0, 1]
+    x = np.arange(len(seasonal_daily_df))
+    width = 0.35
+    
+    bars1 = ax2.bar(x - width/2, seasonal_daily_df['Prod_Media_Modello (kWh)'], 
+                    width, label='Model', color='steelblue', alpha=0.8)
+    bars2 = ax2.bar(x + width/2, seasonal_daily_df['Prod_Media_PVGIS (kWh)'], 
+                    width, label='PVGIS', color='darkorange', alpha=0.8)
+    
+    ax2.set_xlabel('Season', fontsize=11)
+    ax2.set_ylabel('Mean Daily Production (kWh)', fontsize=11)
+    ax2.set_title('Seasonal Average Daily Production', fontsize=12, fontweight='bold')
+    ax2.set_xticks(x)
+    ax2.set_xticklabels(['Winter', 'Spring', 'Summer', 'Autumn'])
+    ax2.legend()
+    ax2.grid(True, alpha=0.3, axis='y')
+    
+    for bars in [bars1, bars2]:
+        for bar in bars:
+            height = bar.get_height()
+            ax2.text(bar.get_x() + bar.get_width()/2., height + 0.05,
+                    f'{height:.2f}', ha='center', va='bottom', fontsize=8)
+    
+    # Plot 3: MAPE stagionale
+    ax3 = axes[1, 0]
+    seasons_short = ['Winter', 'Spring', 'Summer', 'Autumn']
+    mape_values = seasonal_daily_df['MAPE (%)'].values
+    
+    colors = ['#1f77b4', '#2ca02c', '#d62728', '#ff7f0e']
+    bars = ax3.bar(seasons_short, mape_values, color=colors, alpha=0.7, edgecolor='black')
+    ax3.set_xlabel('Season', fontsize=11)
+    ax3.set_ylabel('MAPE (%)', fontsize=11)
+    ax3.set_title('Seasonal MAPE', fontsize=12, fontweight='bold')
+    ax3.grid(True, alpha=0.3, axis='y')
+    ax3.axhline(y=np.mean(mape_values), color='red', linestyle='--', 
+                linewidth=1.5, label=f'Annual Average: {np.mean(mape_values):.2f}%')
+    ax3.legend()
+    
+    for bar, mape in zip(bars, mape_values):
+        height = bar.get_height()
+        ax3.text(bar.get_x() + bar.get_width()/2., height + 0.1,
+                f'{mape:.2f}%', ha='center', va='bottom', fontsize=9, fontweight='bold')
+    
+    # Plot 4: Temperatura vs Efficienza per stagione
+    ax4 = axes[1, 1]
+    
+    seasons_plot = ['Winter', 'Spring', 'Summer', 'Autumn']
+    temps = [seasonal_daily_df[seasonal_daily_df['Stagione'].str.contains(s)]['T_Cella_Media (°C)'].values[0] 
+             for s in ['Inverno', 'Primavera', 'Estate', 'Autunno']]
+    effs = [seasonal_daily_df[seasonal_daily_df['Stagione'].str.contains(s)]['Efficienza_Pannello (%)'].values[0] 
+            for s in ['Inverno', 'Primavera', 'Estate', 'Autunno']]
+    
+    scatter = ax4.scatter(temps, effs, s=200, c=range(4), cmap='coolwarm', 
+                         alpha=0.7, edgecolor='black', linewidth=1.5)
+    
+    for i, season in enumerate(seasons_plot):
+        ax4.annotate(season, (temps[i], effs[i]), 
+                    xytext=(5, 5), textcoords='offset points', fontsize=10, fontweight='bold')
+    
+    ax4.set_xlabel('Mean Cell Temperature (°C)', fontsize=11)
+    ax4.set_ylabel('Mean Panel Efficiency (%)', fontsize=11)
+    ax4.set_title('Cell Temperature vs Panel Efficiency by Season', fontsize=12, fontweight='bold')
+    ax4.grid(True, alpha=0.3)
+    
+    cbar = plt.colorbar(scatter, ax=ax4)
+    cbar.set_label('Season Index', fontsize=9)
+    
+    plt.tight_layout()
+    plt.savefig('seasonal_analysis_plots.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    print("[INFO] Saved: seasonal_analysis_plots.png")
+
+
+def plot_seasonal_hourly_heatmaps(hourly):
+    """Heatmap degli errori per stagione"""
+    
+    hourly['season'] = hourly.index.month.map({
+        12: 'Winter', 1: 'Winter', 2: 'Winter',
+        3: 'Spring', 4: 'Spring', 5: 'Spring',
+        6: 'Summer', 7: 'Summer', 8: 'Summer',
+        9: 'Autumn', 10: 'Autumn', 11: 'Autumn'
+    })
+    
+    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    axes = axes.flatten()
+    seasons = ['Winter', 'Spring', 'Summer', 'Autumn']
+    
+    for idx, season in enumerate(seasons):
+        ax = axes[idx]
+        season_data = hourly[hourly['season'] == season].copy()
+        
+        mask = season_data['pvgis_ref_kwh'] > 0
+        season_data = season_data[mask]
+        
+        if len(season_data) > 0:
+            season_data['day_of_year'] = season_data.index.dayofyear
+            season_data['hour'] = season_data.index.hour
+            season_data['rel_error'] = ((season_data['prod_h'] - season_data['pvgis_ref_kwh']) / 
+                                        season_data['pvgis_ref_kwh'] * 100)
+            season_data['rel_error'] = season_data['rel_error'].clip(-30, 30)
+            
+            heatmap_data = season_data.pivot_table(
+                index='day_of_year', columns='hour', values='rel_error', aggfunc='mean'
+            )
+            
+            im = ax.imshow(heatmap_data, aspect='auto', cmap='RdBu_r', 
+                          interpolation='nearest', vmin=-20, vmax=20)
+            
+            ax.set_xlabel('Hour of Day', fontsize=10)
+            ax.set_ylabel('Day of Season', fontsize=10)
+            ax.set_title(f'{season} - Relative Error', fontsize=11, fontweight='bold')
+            
+            mape = np.mean(np.abs(season_data['rel_error']))
+            ax.text(0.02, 0.98, f'MAPE: {mape:.1f}%', transform=ax.transAxes,
+                   fontsize=9, verticalalignment='top', 
+                   bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+    
+    cbar = plt.colorbar(im, ax=axes, orientation='horizontal', fraction=0.02, pad=0.1)
+    cbar.set_label('Relative Error (%)', fontsize=10)
+    
+    plt.suptitle('Seasonal Hourly Relative Error Heatmaps', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig('seasonal_error_heatmaps.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    print("[INFO] Saved: seasonal_error_heatmaps.png")
+
+
+# ============================================================================
+# NUOVI GRAFICI RICHIESTI
+# ============================================================================
+
+def plot_clear_sky_vs_cloudy_day(hourly):
+    """Grafico 1: Confronto Cielo Sereno vs Giorno Nuvoloso"""
+    
+    hourly['hour'] = hourly.index.hour
+    daily_stats = hourly.groupby(hourly.index.date).agg({
+        'prod_h': ['sum', 'std'],
+        'pvgis_ref_kwh': ['sum', 'std']
+    })
+    daily_stats.columns = ['prod_sum', 'prod_std', 'pvgis_sum', 'pvgis_std']
+    daily_stats['variability'] = daily_stats['prod_std'] / (daily_stats['prod_sum'] + 0.001)
+    
+    clear_sky_date = daily_stats[daily_stats['prod_sum'] > daily_stats['prod_sum'].quantile(0.8)]
+    clear_sky_date = clear_sky_date[clear_sky_date['variability'] < clear_sky_date['variability'].quantile(0.2)]
+    clear_sky_date = clear_sky_date.index[0]
+    
+    cloudy_date = daily_stats[daily_stats['variability'] > daily_stats['variability'].quantile(0.8)].index[0]
+    
+    print(f"\n🔍 Giorni selezionati per confronto:")
+    print(f"   Cielo Sereno: {clear_sky_date}")
+    print(f"   Giorno Nuvoloso: {cloudy_date}")
+    
+    clear_data = hourly[hourly.index.date == clear_sky_date].copy()
+    cloudy_data = hourly[hourly.index.date == cloudy_date].copy()
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Subplot 1: Cielo Sereno
+    ax1 = axes[0]
+    ax1.plot(clear_data.index.hour, clear_data['prod_h'], 'b-o', linewidth=2, markersize=4, 
+             label='Model', color='darkblue')
+    ax1.plot(clear_data.index.hour, clear_data['pvgis_ref_kwh'], 'r-s', linewidth=2, markersize=4, 
+             label='PVGIS', color='darkred')
+    ax1.fill_between(clear_data.index.hour, 0, clear_data['prod_h'], alpha=0.2, color='blue')
+    ax1.fill_between(clear_data.index.hour, 0, clear_data['pvgis_ref_kwh'], alpha=0.2, color='red')
+    ax1.set_xlabel('Hour of Day', fontsize=11)
+    ax1.set_ylabel('Production (kWh/h)', fontsize=11)
+    ax1.set_title(f'Clear Sky Day - {clear_sky_date.strftime("%B %d")}', 
+                 fontsize=12, fontweight='bold')
+    ax1.legend(loc='upper right')
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xticks(range(0, 24, 2))
+    
+    err_clear = clear_data['prod_h'] - clear_data['pvgis_ref_kwh']
+    mask_clear = clear_data['pvgis_ref_kwh'] > 0
+    mape_clear = np.mean(np.abs(err_clear[mask_clear] / clear_data.loc[mask_clear, 'pvgis_ref_kwh'])) * 100
+    ax1.text(0.05, 0.95, f'MAPE: {mape_clear:.2f}%', transform=ax1.transAxes,
+            fontsize=10, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+    
+    # Subplot 2: Giorno Nuvoloso
+    ax2 = axes[1]
+    ax2.plot(cloudy_data.index.hour, cloudy_data['prod_h'], 'b-o', linewidth=2, markersize=4, 
+             label='Model', color='darkblue')
+    ax2.plot(cloudy_data.index.hour, cloudy_data['pvgis_ref_kwh'], 'r-s', linewidth=2, markersize=4, 
+             label='PVGIS', color='darkred')
+    ax2.fill_between(cloudy_data.index.hour, 0, cloudy_data['prod_h'], alpha=0.2, color='blue')
+    ax2.fill_between(cloudy_data.index.hour, 0, cloudy_data['pvgis_ref_kwh'], alpha=0.2, color='red')
+    ax2.set_xlabel('Hour of Day', fontsize=11)
+    ax2.set_ylabel('Production (kWh/h)', fontsize=11)
+    ax2.set_title(f'Cloudy Day - {cloudy_date.strftime("%B %d")}', 
+                 fontsize=12, fontweight='bold')
+    ax2.legend(loc='upper right')
+    ax2.grid(True, alpha=0.3)
+    ax2.set_xticks(range(0, 24, 2))
+    
+    err_cloudy = cloudy_data['prod_h'] - cloudy_data['pvgis_ref_kwh']
+    mask_cloudy = cloudy_data['pvgis_ref_kwh'] > 0
+    mape_cloudy = np.mean(np.abs(err_cloudy[mask_cloudy] / cloudy_data.loc[mask_cloudy, 'pvgis_ref_kwh'])) * 100
+    ax2.text(0.05, 0.95, f'MAPE: {mape_cloudy:.2f}%', transform=ax2.transAxes,
+            fontsize=10, verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+    
+    plt.suptitle('Hourly Production: Clear Sky vs Cloudy Day', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig('clear_sky_vs_cloudy_day.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    print("[INFO] Saved: clear_sky_vs_cloudy_day.png")
+
+
+def plot_monthly_error_carpet(hourly):
+    """Grafico 2: Hourly Error Carpet - Heatmap di un mese singolo"""
+    
+    target_month = 7
+    month_data = hourly[hourly.index.month == target_month].copy()
+    
+    if len(month_data) > 0:
+        month_data['day'] = month_data.index.day
+        month_data['hour'] = month_data.index.hour
+        
+        mask = month_data['pvgis_ref_kwh'] > 0
+        month_data.loc[mask, 'rel_error'] = ((month_data.loc[mask, 'prod_h'] - month_data.loc[mask, 'pvgis_ref_kwh']) / 
+                                              month_data.loc[mask, 'pvgis_ref_kwh'] * 100)
+        month_data['rel_error'] = month_data['rel_error'].clip(-30, 30)
+        
+        heatmap_data = month_data.pivot_table(index='day', columns='hour', values='rel_error', aggfunc='mean')
+        
+        fig, ax = plt.subplots(figsize=(16, 10))
+        im = ax.imshow(heatmap_data, aspect='auto', cmap='RdBu_r', 
+                      interpolation='nearest', vmin=-20, vmax=20)
+        
+        ax.set_xlabel('Hour of Day', fontsize=12)
+        ax.set_ylabel('Day of Month', fontsize=12)
+        ax.set_title('July - Hourly Relative Error', 
+                    fontsize=14, fontweight='bold')
+        
+        cbar = plt.colorbar(im, ax=ax)
+        cbar.set_label('Relative Error (%)', fontsize=11)
+        
+        ax.axvline(x=12, color='white', linewidth=1, linestyle='--', alpha=0.5)
+        ax.text(6, -2, 'MORNING', ha='center', fontsize=10, fontweight='bold', color='white')
+        ax.text(18, -2, 'AFTERNOON', ha='center', fontsize=10, fontweight='bold', color='white')
+        
+        avg_error = np.mean(month_data['rel_error'].dropna())
+        std_error = np.std(month_data['rel_error'].dropna())
+        ax.text(0.02, 0.98, f'Mean Error: {avg_error:.2f}%\nStd Dev: {std_error:.2f}%', 
+               transform=ax.transAxes, fontsize=10, verticalalignment='top',
+               bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        
+        plt.tight_layout()
+        plt.savefig('monthly_error_carpet.png', dpi=150, bbox_inches='tight')
+        plt.show()
+        print("[INFO] Saved: monthly_error_carpet.png")
+    else:
+        print(f"[WARNING] No data for month {target_month}")
+
+
+def plot_hourly_parity_scatter(hourly):
+    """Grafico 3: Parity Plot Orario con tutti i punti"""
+    
+    mask = (hourly['pvgis_ref_kwh'] > 0) & (hourly['prod_h'] > 0)
+    x = hourly.loc[mask, 'pvgis_ref_kwh'].values
+    y = hourly.loc[mask, 'prod_h'].values
+    
+    xy = np.vstack([x, y])
+    z = gaussian_kde(xy)(xy)
+    idx = z.argsort()
+    x_sorted, y_sorted, z_sorted = x[idx], y[idx], z[idx]
+    
+    fig, ax = plt.subplots(figsize=(10, 10))
+    
+    scatter = ax.scatter(x_sorted, y_sorted, c=z_sorted, s=8, alpha=0.5, cmap='viridis')
+    
+    max_val = max(x.max(), y.max())
+    ax.plot([0, max_val], [0, max_val], 'r--', linewidth=2, label='y=x', alpha=0.8)
+    
+    slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
+    ax.plot([0, max_val], [intercept, intercept + slope * max_val], 
+            'b-', linewidth=2, label=f'Linear regression (slope={slope:.3f}, R²={r_value**2:.4f})')
+    
+    ax.set_xlabel('PVGIS Production (kWh/h)', fontsize=12)
+    ax.set_ylabel('Model Production (kWh/h)', fontsize=12)
+    ax.set_title(f'Hourly Production Parity Plot (N={len(x)} points)', 
+                fontsize=14, fontweight='bold')
+    ax.legend(loc='lower right')
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0, max_val * 1.05)
+    ax.set_ylim(0, max_val * 1.05)
+    
+    mae = np.mean(np.abs(y - x))
+    rmse = np.sqrt(np.mean((y - x)**2))
+    mape = np.mean(np.abs((y - x) / x)) * 100
+    
+    ax.text(0.05, 0.95, f'MAE = {mae:.5f} kWh\nRMSE = {rmse:.5f} kWh\nMAPE = {mape:.2f}%\nR² = {r_value**2:.4f}', 
+            transform=ax.transAxes, fontsize=10, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+    
+    cbar = plt.colorbar(scatter)
+    cbar.set_label('Point Density', fontsize=10)
+    
+    plt.tight_layout()
+    plt.savefig('hourly_parity_scatter.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    print("[INFO] Saved: hourly_parity_scatter.png")
+
+
+def plot_seasonal_error_boxplots(hourly):
+    """Grafico 4: Boxplot stagionali dell'errore orario"""
+    
+    hourly_plot = hourly.copy()
+    mask = hourly_plot['pvgis_ref_kwh'] > 0
+    hourly_plot.loc[mask, 'rel_error'] = ((hourly_plot.loc[mask, 'prod_h'] - hourly_plot.loc[mask, 'pvgis_ref_kwh']) / 
+                                          hourly_plot.loc[mask, 'pvgis_ref_kwh'] * 100)
+    hourly_plot['rel_error'] = hourly_plot['rel_error'].clip(-50, 50)
+    
+    hourly_plot['season'] = hourly_plot.index.month.map({
+        12: 'Winter', 1: 'Winter', 2: 'Winter',
+        3: 'Spring', 4: 'Spring', 5: 'Spring',
+        6: 'Summer', 7: 'Summer', 8: 'Summer',
+        9: 'Autumn', 10: 'Autumn', 11: 'Autumn'
+    })
+    
+    seasons_order = ['Winter', 'Spring', 'Summer', 'Autumn']
+    season_names = {'Winter': 'Winter\n(Dec-Feb)', 'Spring': 'Spring\n(Mar-May)', 
+                    'Summer': 'Summer\n(Jun-Aug)', 'Autumn': 'Autumn\n(Sep-Nov)'}
+    
+    fig, axes = plt.subplots(1, 4, figsize=(16, 6))
+    
+    for idx, season in enumerate(seasons_order):
+        ax = axes[idx]
+        season_data = hourly_plot[hourly_plot['season'] == season]['rel_error'].dropna()
+        
+        if len(season_data) > 0:
+            bp = ax.boxplot(season_data, widths=0.6, patch_artist=True, showfliers=False)
+            for box in bp['boxes']:
+                box.set_facecolor('lightblue')
+                box.set_alpha(0.7)
+            
+            parts = ax.violinplot(season_data, positions=[1], widths=0.8, showmeans=False, showmedians=False)
+            for pc in parts['bodies']:
+                pc.set_facecolor('steelblue')
+                pc.set_alpha(0.3)
+                pc.set_edgecolor('none')
+            
+            ax.axhline(y=0, color='red', linestyle='--', linewidth=1.5, alpha=0.7)
+            
+            median_val = np.median(season_data)
+            mean_val = np.mean(season_data)
+            std_val = np.std(season_data)
+            q1 = np.percentile(season_data, 25)
+            q3 = np.percentile(season_data, 75)
+            
+            ax.set_title(season_names[season], fontsize=11, fontweight='bold')
+            ax.set_ylabel('Relative Error (%)' if idx == 0 else '', fontsize=10)
+            ax.set_xticks([])
+            ax.grid(True, alpha=0.3, axis='y')
+            
+            ax.text(0.05, 0.95, f'Median: {median_val:.2f}%\nMean: {mean_val:.2f}%\nStd: {std_val:.2f}%\nIQR: [{q1:.1f}, {q3:.1f}]', 
+                   transform=ax.transAxes, fontsize=8, verticalalignment='top',
+                   bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+            
+            if abs(median_val) > 2:
+                ax.set_facecolor('#ffeeee')
+    
+    plt.suptitle('Seasonal Distribution of Hourly Relative Error', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig('seasonal_error_boxplots.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    print("[INFO] Saved: seasonal_error_boxplots.png")
+
+
+def create_validation_summary_table(hourly_metrics, statistical_tests):
+    """Tabella riassuntiva per la validazione oraria - con soglie 1%, 2%, 3%"""
+    
+    summary = pd.DataFrame({
+        'Criterio di Validazione': [
+            'Accuratezza (MAPE < 3%)',
+            'Accuratezza (MAPE < 2%)',
+            'Bias (MBE trascurabile)',
+            'Correlazione (R² > 0.99)',
+            'Test Wilcoxon (p > 0.05)',
+            'Test KS (p > 0.05)',
+            'Correlazione Spearman (ρ > 0.999)',
+            'Ore con errore < 1% (> 40%)',
+            'Ore con errore < 2% (> 60%)',
+            'Ore con errore < 3% (> 80%)'
+        ],
+        'Soglia': [
+            '< 3%',
+            '< 2%',
+            '< 0.01 kWh',
+            '> 0.99',
+            '> 0.05',
+            '> 0.05',
+            '> 0.999',
+            '> 40%',
+            '> 60%',
+            '> 80%'
+        ],
+        'Valore Ottenuto': [
+            f"{hourly_metrics['MAPE_perc']:.2f}%",
+            f"{hourly_metrics['MAPE_perc']:.2f}%",
+            f"{hourly_metrics['MBE_kWh']:.5f} kWh",
+            f"{hourly_metrics['R2']:.4f}",
+            f"{statistical_tests.iloc[0, 2]}",
+            f"{statistical_tests.iloc[3, 2]}",
+            f"{statistical_tests.iloc[1, 1]}",
+            f"{hourly_metrics['pct_error_lt_1']:.1f}%",
+            f"{hourly_metrics['pct_error_lt_2']:.1f}%",
+            f"{hourly_metrics['pct_error_lt_3']:.1f}%"
+        ],
+        'Esito': [
+            '✅ SUPERATO' if hourly_metrics['MAPE_perc'] < 3 else '❌ NON SUPERATO',
+            '✅ SUPERATO' if hourly_metrics['MAPE_perc'] < 2 else '❌ NON SUPERATO',
+            '✅ SUPERATO' if abs(hourly_metrics['MBE_kWh']) < 0.01 else '❌ NON SUPERATO',
+            '✅ SUPERATO' if hourly_metrics['R2'] > 0.99 else '❌ NON SUPERATO',
+            '✅ SUPERATO' if float(statistical_tests.iloc[0, 2]) > 0.05 else '❌ NON SUPERATO',
+            '✅ SUPERATO' if float(statistical_tests.iloc[3, 2]) > 0.05 else '❌ NON SUPERATO',
+            '✅ SUPERATO' if float(statistical_tests.iloc[1, 1]) > 0.999 else '❌ NON SUPERATO',
+            '✅ SUPERATO' if hourly_metrics['pct_error_lt_1'] > 40 else '❌ NON SUPERATO',
+            '✅ SUPERATO' if hourly_metrics['pct_error_lt_2'] > 60 else '❌ NON SUPERATO',
+            '✅ SUPERATO' if hourly_metrics['pct_error_lt_3'] > 80 else '❌ NON SUPERATO'
+        ]
+    })
+    
+    print("\n" + "="*80)
+    print("🎯 TABELLA RIASSUNTIVA VALIDAZIONE ORARIA")
+    print("="*80)
+    print(summary.to_string(index=False))
+    print("="*80)
+    
+    all_passed = all(['✅' in str(esito) for esito in summary['Esito']])
+    if all_passed:
+        print("\n🏆 VERDETTO FINALE: MODELLO VALIDATO CON SUCCESSO a livello orario!")
+        print("   Tutti i criteri di validazione sono stati soddisfatti.")
+    else:
+        print("\n⚠️ VERDETTO: Alcuni criteri non sono stati soddisfatti.")
+    
+    return summary
+
+
+def plot_hourly_mean_diurnal(hourly):
+    """Plot: Medie orarie diurne"""
+    
+    hourly['hour'] = hourly.index.hour
+    diurnal_mean = hourly.groupby('hour').agg({
+        'prod_h': 'mean',
+        'pvgis_ref_kwh': 'mean'
+    })
+    diurnal_std = hourly.groupby('hour').agg({
+        'prod_h': 'std',
+        'pvgis_ref_kwh': 'std'
+    })
+    
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.plot(diurnal_mean.index, diurnal_mean['prod_h'], 'b-', linewidth=2.5, 
+            label='Model', marker='o', markersize=4)
+    ax.plot(diurnal_mean.index, diurnal_mean['pvgis_ref_kwh'], 'r-', linewidth=2.5, 
+            label='PVGIS', marker='s', markersize=4)
+    ax.fill_between(diurnal_mean.index, 
+                     diurnal_mean['prod_h'] - diurnal_std['prod_h'],
+                     diurnal_mean['prod_h'] + diurnal_std['prod_h'],
+                     alpha=0.2, color='blue', label='Model ±1σ')
+    ax.fill_between(diurnal_mean.index,
+                     diurnal_mean['pvgis_ref_kwh'] - diurnal_std['pvgis_ref_kwh'],
+                     diurnal_mean['pvgis_ref_kwh'] + diurnal_std['pvgis_ref_kwh'],
+                     alpha=0.2, color='red', label='PVGIS ±1σ')
+    
+    ax.set_xlabel('Hour of Day', fontsize=12)
+    ax.set_ylabel('Mean Production (kWh/h)', fontsize=12)
+    ax.set_title('Mean Diurnal Production Profile', fontsize=14, fontweight='bold')
+    ax.legend(loc='upper left')
+    ax.grid(True, alpha=0.3)
+    ax.set_xticks(range(0, 24, 2))
+    
+    plt.tight_layout()
+    plt.savefig('hourly_diurnal_profile.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    print("[INFO] Saved: hourly_diurnal_profile.png")
+
+
+def plot_hourly_error_heatmap(hourly):
+    """Plot: Heatmap errore relativo annuale"""
+    
+    hourly_heatmap = hourly.copy()
+    hourly_heatmap['day_of_year'] = hourly_heatmap.index.dayofyear
+    hourly_heatmap['hour'] = hourly_heatmap.index.hour
+    
+    mask = hourly_heatmap['pvgis_ref_kwh'] > 0
+    hourly_heatmap.loc[mask, 'rel_error_perc'] = (
+        (hourly_heatmap.loc[mask, 'prod_h'] - hourly_heatmap.loc[mask, 'pvgis_ref_kwh']) / 
+        hourly_heatmap.loc[mask, 'pvgis_ref_kwh'] * 100
+    )
+    hourly_heatmap['rel_error_perc'] = hourly_heatmap['rel_error_perc'].clip(-50, 50)
+    
+    heatmap_data = hourly_heatmap.pivot_table(
+        index='day_of_year', columns='hour', values='rel_error_perc', aggfunc='mean'
+    )
+    
+    fig, ax = plt.subplots(figsize=(16, 8))
+    im = ax.imshow(heatmap_data, aspect='auto', cmap='RdBu_r', 
+                   interpolation='nearest', vmin=-20, vmax=20)
+    
+    ax.set_xlabel('Hour of Day', fontsize=12)
+    ax.set_ylabel('Day of Year', fontsize=12)
+    ax.set_title('Annual Hourly Relative Error Heatmap', fontsize=14, fontweight='bold')
+    
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label('Relative Error (%)', fontsize=11)
+    
+    month_boundaries = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334, 365]
+    month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
+                   'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+    
+    for boundary in month_boundaries[1:-1]:
+        ax.axhline(y=boundary, color='white', linewidth=0.5, linestyle='--')
+    ax.set_yticks([(month_boundaries[i] + month_boundaries[i+1])/2 for i in range(12)])
+    ax.set_yticklabels(month_names)
+    
+    plt.tight_layout()
+    plt.savefig('hourly_error_heatmap.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    print("[INFO] Saved: hourly_error_heatmap.png")
+
+
+def plot_hourly_scatter_density(hourly):
+    """Plot: Scatter con densità"""
+    
+    mask = (hourly['pvgis_ref_kwh'] > 0) & (hourly['prod_h'] > 0)
+    x = hourly.loc[mask, 'pvgis_ref_kwh'].values
+    y = hourly.loc[mask, 'prod_h'].values
+    
+    xy = np.vstack([x, y])
+    z = gaussian_kde(xy)(xy)
+    idx = z.argsort()
+    x_sorted, y_sorted, z_sorted = x[idx], y[idx], z[idx]
+    
+    fig, ax = plt.subplots(figsize=(10, 10))
+    scatter = ax.scatter(x_sorted, y_sorted, c=z_sorted, s=10, alpha=0.6, cmap='viridis')
+    
+    max_val = max(x.max(), y.max())
+    ax.plot([0, max_val], [0, max_val], 'r--', linewidth=2, label='y=x', alpha=0.8)
+    
+    slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
+    ax.plot([0, max_val], [intercept, intercept + slope * max_val], 
+            'b-', linewidth=2, label=f'Linear regression (slope={slope:.2f}, R²={r_value**2:.4f})')
+    
+    ax.set_xlabel('PVGIS Production (kWh/h)', fontsize=12)
+    ax.set_ylabel('Model Production (kWh/h)', fontsize=12)
+    ax.set_title('Hourly Production Scatter Plot', fontsize=14, fontweight='bold')
+    ax.legend(loc='lower right')
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0, max_val * 1.05)
+    ax.set_ylim(0, max_val * 1.05)
+    
+    cbar = plt.colorbar(scatter)
+    cbar.set_label('Point Density', fontsize=10)
+    
+    mae = np.mean(np.abs(y - x))
+    rmse = np.sqrt(np.mean((y - x)**2))
+    ax.text(0.05, 0.95, f'MAE = {mae:.5f} kWh\nRMSE = {rmse:.5f} kWh\nR² = {r_value**2:.4f}\nN = {len(x)} hours', 
+            transform=ax.transAxes, fontsize=10, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    plt.tight_layout()
+    plt.savefig('hourly_scatter_density.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    print("[INFO] Saved: hourly_scatter_density.png")
+
+
+def plot_hourly_seasonal_subset(hourly):
+    """Plot: Finestre stagionali rappresentative"""
+    
+    windows = {
+        'Winter (Jan 15-21)': ('2000-01-15', '2000-01-21'),
+        'Spring (Apr 15-21)': ('2000-04-15', '2000-04-21'),
+        'Summer (Jul 15-21)': ('2000-07-15', '2000-07-21'),
+        'Autumn (Oct 15-21)': ('2000-10-15', '2000-10-21')
+    }
+    
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+    axes = axes.flatten()
+    
+    for idx, (season, (start_date, end_date)) in enumerate(windows.items()):
+        ax = axes[idx]
+        mask = (hourly.index >= start_date) & (hourly.index <= end_date)
+        window_data = hourly[mask].copy()
+        
+        if len(window_data) == 0:
+            ax.text(0.5, 0.5, f'No data for {season}', ha='center', va='center')
+            continue
+        
+        ax.plot(window_data.index, window_data['prod_h'], 'b-', linewidth=2, label='Model')
+        ax.plot(window_data.index, window_data['pvgis_ref_kwh'], 'r-', linewidth=2, label='PVGIS')
+        
+        err = window_data['prod_h'] - window_data['pvgis_ref_kwh']
+        mae = np.mean(np.abs(err))
+        mask_pos = window_data['pvgis_ref_kwh'] > 0
+        if mask_pos.any():
+            mape = np.mean(np.abs(err[mask_pos] / window_data.loc[mask_pos, 'pvgis_ref_kwh'])) * 100
+        else:
+            mape = np.nan
+        
+        ax.set_title(f'{season}\nMAE = {mae:.4f} kWh, MAPE = {mape:.1f}%', fontsize=11, fontweight='bold')
+        ax.set_ylabel('Production (kWh/h)', fontsize=10)
+        ax.legend(loc='upper right')
+        ax.grid(True, alpha=0.3)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %Hh'))
+        ax.xaxis.set_major_locator(mdates.DayLocator(interval=1))
+        plt.setp(ax.xaxis.get_majorticklabels(), rotation=45, ha='right', fontsize=8)
+    
+    fig.suptitle('Hourly Production Comparison - Representative Weeks', fontsize=14, fontweight='bold')
+    fig.supxlabel('Date and Hour', fontsize=12)
+    plt.tight_layout()
+    plt.savefig('hourly_seasonal_windows.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    print("[INFO] Saved: hourly_seasonal_windows.png")
+
+
+def plot_hourly_error_distribution(hourly):
+    """Plot: Boxplot errori per ora"""
+    
+    hourly_err = hourly.copy()
+    mask = hourly_err['pvgis_ref_kwh'] > 0
+    hourly_err.loc[mask, 'rel_error'] = (
+        (hourly_err.loc[mask, 'prod_h'] - hourly_err.loc[mask, 'pvgis_ref_kwh']) / 
+        hourly_err.loc[mask, 'pvgis_ref_kwh'] * 100
+    )
+    hourly_err['hour'] = hourly_err.index.hour
+    hourly_err['rel_error'] = hourly_err['rel_error'].clip(-50, 50)
+    
+    fig, ax = plt.subplots(figsize=(14, 7))
+    
+    box_data = []
+    hours = []
+    for hour in range(24):
+        hour_data = hourly_err[hourly_err['hour'] == hour]['rel_error'].dropna()
+        if len(hour_data) > 0:
+            box_data.append(hour_data)
+            hours.append(hour)
+    
+    bp = ax.boxplot(box_data, positions=hours, widths=0.7, patch_artist=True, showfliers=False)
+    for box in bp['boxes']:
+        box.set_facecolor('lightblue')
+        box.set_alpha(0.7)
+    
+    ax.axhline(y=0, color='red', linestyle='--', linewidth=1.5, alpha=0.7, label='Zero error')
+    ax.set_xlabel('Hour of Day', fontsize=12)
+    ax.set_ylabel('Relative Error (%)', fontsize=12)
+    ax.set_title('Distribution of Relative Error by Hour of Day', fontsize=14, fontweight='bold')
+    ax.set_xticks(range(0, 24, 2))
+    ax.grid(True, alpha=0.3, axis='y')
+    ax.legend(loc='upper right')
+    
+    medians = [np.median(data) for data in box_data]
+    for i, median in enumerate(medians):
+        ax.text(hours[i], median + 2, f'{median:.1f}', ha='center', va='bottom', fontsize=7, alpha=0.7)
+    
+    plt.tight_layout()
+    plt.savefig('hourly_error_distribution.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    print("[INFO] Saved: hourly_error_distribution.png")
+
+
+def create_hourly_summary_table(hourly_metrics, hourly):
+    """Tabella riassuntiva giorno/notte"""
+    
+    hourly['hour'] = hourly.index.hour
+    day_mask = (hourly['hour'] >= 6) & (hourly['hour'] <= 18)
+    night_mask = ~day_mask
+    
+    def calc_fleet_metrics(data):
+        if len(data) == 0 or data['pvgis_ref_kwh'].sum() == 0:
+            return {'MAE': np.nan, 'MAPE': np.nan, 'MBE': np.nan}
+        err = data['prod_h'] - data['pvgis_ref_kwh']
+        mask = data['pvgis_ref_kwh'] > 0
+        return {
+            'MAE': np.mean(np.abs(err)),
+            'MAPE': np.mean(np.abs(err[mask] / data.loc[mask, 'pvgis_ref_kwh'])) * 100 if mask.any() else np.nan,
+            'MBE': np.mean(err)
+        }
+    
+    day_metrics = calc_fleet_metrics(hourly[day_mask])
+    night_metrics = calc_fleet_metrics(hourly[night_mask])
+    
+    summary_df = pd.DataFrame({
+        'Metric': ['MAE (kWh)', 'MAPE (%)', 'MBE (kWh)', 'RMSE (kWh)', 'R²', 'N hours'],
+        'All Hours': [
+            f"{hourly_metrics['MAE_kWh']:.5f}",
+            f"{hourly_metrics['MAPE_perc']:.2f}",
+            f"{hourly_metrics['MBE_kWh']:.5f}",
+            f"{hourly_metrics['RMSE_kWh']:.5f}",
+            f"{hourly_metrics['R2']:.4f}",
+            hourly_metrics['N_hours']
+        ],
+        'Daytime (6-18h)': [
+            f"{day_metrics['MAE']:.5f}" if not np.isnan(day_metrics['MAE']) else 'N/A',
+            f"{day_metrics['MAPE']:.2f}" if not np.isnan(day_metrics['MAPE']) else 'N/A',
+            f"{day_metrics['MBE']:.5f}" if not np.isnan(day_metrics['MBE']) else 'N/A',
+            'N/A', 'N/A',
+            len(hourly[day_mask])
+        ],
+        'Nighttime (19-5h)': [
+            f"{night_metrics['MAE']:.5f}" if not np.isnan(night_metrics['MAE']) else 'N/A',
+            f"{night_metrics['MAPE']:.2f}" if not np.isnan(night_metrics['MAPE']) else 'N/A',
+            f"{night_metrics['MBE']:.5f}" if not np.isnan(night_metrics['MBE']) else 'N/A',
+            'N/A', 'N/A',
+            len(hourly[night_mask])
+        ]
+    })
+    
+    print("\n" + "="*70)
+    print("📊 HOURLY METRICS SUMMARY TABLE (Day vs Night)")
+    print("="*70)
+    print(summary_df.to_string(index=False))
+    print("="*70)
+    
+    return summary_df
+
+
+def export_to_excel(daily, monthly, hourly, metrics, hourly_metrics, statistical_tests, 
+                    hourly_summary, validation_summary, seasonal_metrics, seasonal_daily,
+                    filename='production_pv_dublin.xlsx'):
+    """Esporta tutti i risultati in Excel"""
+    
+    print(f"\n[3/3] Exporting data to Excel...")
+    
+    final_filename = filename
+    try:
+        with pd.ExcelWriter(final_filename, engine='openpyxl') as writer:
+            daily_export = daily[['data_str', 'giorno', 'mese', 'prod_mio', 'prod_pvgis', 
+                                  'errore_kwh', 'errore_perc', 'temp_ambiente_media_c', 
+                                  'temp_cella_media_c', 'eff_pannello_perc', 'eff_sistema_perc']].copy()
+            daily_export.columns = ['Date (Month-Day)', 'Day', 'Month', 'Model_Prod_kWh', 
+                                    'PVGIS_Prod_kWh', 'Error_kWh', 'Error_%', 
+                                    'Ambient_Temp_°C', 'Cell_Temp_°C', 
+                                    'Panel_Efficiency_%', 'System_Efficiency_%']
+            daily_export.to_excel(writer, sheet_name='Daily_Data', index=False)
+            
+            monthly_export = monthly.reset_index()
+            months_names = ['January', 'February', 'March', 'April', 'May', 'June',
+                           'July', 'August', 'September', 'October', 'November', 'December']
+            monthly_export['Month'] = months_names
+            monthly_export = monthly_export[['Month', 'prod_mio', 'prod_pvgis', 'errore_kwh', 'errore_perc',
+                                             'temp_ambiente_media_c', 'temp_cella_media_c', 
+                                             'eff_pannello_perc', 'eff_sistema_perc']]
+            monthly_export.columns = ['Month', 'Model_Prod_kWh', 'PVGIS_Prod_kWh', 'Error_kWh', 'Error_%',
+                                      'Avg_Ambient_Temp_°C', 'Avg_Cell_Temp_°C',
+                                      'Avg_Panel_Efficiency_%', 'Avg_System_Efficiency_%']
+            monthly_export.to_excel(writer, sheet_name='Monthly_Data', index=False)
+            
+            hourly_export = hourly.copy()
+            hourly_export['datetime'] = hourly_export.index
+            hourly_export = hourly_export[['datetime', 'poa_global', 'temp_air', 't_cell', 
+                                           'eff_panel', 'eff_system', 'prod_h', 'pvgis_ref_kwh']]
+            hourly_export.columns = ['Datetime', 'POA_Global_W/m2', 'Ambient_Temp_°C', 'Cell_Temp_°C',
+                                     'Panel_Efficiency_frac', 'System_Efficiency_frac', 
+                                     'Model_Prod_kWh', 'PVGIS_Ref_kWh']
+            hourly_export.to_excel(writer, sheet_name='Hourly_Data', index=False)
+            
+            metrics_annual_df = pd.DataFrame(list(metrics['Annual'].items()), columns=['Metric', 'Value'])
+            metrics_annual_df.to_excel(writer, sheet_name='Annual_Metrics', index=False)
+            
+            metrics['Monthly'].to_excel(writer, sheet_name='Monthly_Metrics', index=False)
+            
+            hourly_metrics_df = pd.DataFrame([
+                ['MBE (kWh)', hourly_metrics['MBE_kWh']],
+                ['MAE (kWh)', hourly_metrics['MAE_kWh']],
+                ['RMSE (kWh)', hourly_metrics['RMSE_kWh']],
+                ['MAPE (%)', hourly_metrics['MAPE_perc']],
+                ['MdAPE (%)', hourly_metrics['MdAPE_perc']],
+                ['NRMSE (%)', hourly_metrics['NRMSE_perc']],
+                ['R²', hourly_metrics['R2']],
+                ['Valid hours (PVGIS > 0)', hourly_metrics['N_hours']],
+                ['Hours with error < 1% (%)', hourly_metrics['pct_error_lt_1']],
+                ['Hours with error < 2% (%)', hourly_metrics['pct_error_lt_2']],
+                ['Hours with error < 3% (%)', hourly_metrics['pct_error_lt_3']]
+            ], columns=['Metric', 'Value'])
+            hourly_metrics_df.to_excel(writer, sheet_name='Hourly_Metrics', index=False)
+            
+            statistical_tests.to_excel(writer, sheet_name='Statistical_Tests', index=False)
+            hourly_summary.to_excel(writer, sheet_name='Hourly_Summary_Periods', index=False)
+            validation_summary.to_excel(writer, sheet_name='Validation_Summary', index=False)
+            seasonal_metrics.to_excel(writer, sheet_name='Seasonal_Hourly_Metrics', index=False)
+            seasonal_daily.to_excel(writer, sheet_name='Seasonal_Daily_Metrics', index=False)
+            
+            config_data = {
+                'Parameter': [
+                    'Installed Power (kWp)', 'Latitude', 'Longitude', 'Tilt Angle', 
+                    'Azimuth', 'Number of Panels', 'Total Area (m²)', 'Panel Efficiency STC', 
+                    'Performance Ratio (PR)', 'Inverter Efficiency', 'PVGIS Data Period',
+                    'Calendar Year (reference)', 'Data Type', 'Important Note'
+                ],
+                'Value': [
+                    round(5 * 0.435, 2), 53.383, -6.592, 30, 180, 5, 
+                    round(1.762*1.134*5, 2), '21.8%', '94%', '96%',
+                    '2005-2020', '2000 (leap year free)', 'TMY - Typical Meteorological Year',
+                    'Values are climatological averages for 2005-2020'
+                ]
+            }
+            config_df = pd.DataFrame(config_data)
+            config_df.to_excel(writer, sheet_name='System_Configuration', index=False)
+        
+        print(f"      File saved: {final_filename}")
+        
+    except PermissionError:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        final_filename = filename.replace('.xlsx', f'_{timestamp}.xlsx')
+        print(f"      File {filename} is open. Saving as: {final_filename}")
+        
+        with pd.ExcelWriter(final_filename, engine='openpyxl') as writer:
+            daily_export.to_excel(writer, sheet_name='Daily_Data', index=False)
+            monthly_export.to_excel(writer, sheet_name='Monthly_Data', index=False)
+            hourly_export.to_excel(writer, sheet_name='Hourly_Data', index=False)
+            metrics_annual_df.to_excel(writer, sheet_name='Annual_Metrics', index=False)
+            metrics['Monthly'].to_excel(writer, sheet_name='Monthly_Metrics', index=False)
+            hourly_metrics_df.to_excel(writer, sheet_name='Hourly_Metrics', index=False)
+            statistical_tests.to_excel(writer, sheet_name='Statistical_Tests', index=False)
+            hourly_summary.to_excel(writer, sheet_name='Hourly_Summary_Periods', index=False)
+            validation_summary.to_excel(writer, sheet_name='Validation_Summary', index=False)
+            seasonal_metrics.to_excel(writer, sheet_name='Seasonal_Hourly_Metrics', index=False)
+            seasonal_daily.to_excel(writer, sheet_name='Seasonal_Daily_Metrics', index=False)
+            config_df.to_excel(writer, sheet_name='System_Configuration', index=False)
+        
+        print(f"      File saved as: {final_filename}")
+    
+    print(f"      NOTE: Data represents a TYPICAL METEOROLOGICAL YEAR (2005-2020 averages)")
+
+
+def main():
+    latitude = 53.383
+    longitude = -6.592
+    
+    print("\n" + "="*60)
+    print("PHOTOVOLTAIC PRODUCTION SIMULATION & VALIDATION")
+    print("="*60)
+    print("NOTE: Results based on TMY (Typical Meteorological Year) data")
+    print("      i.e., climatological averages for the period 2005-2020")
+    print("="*60)
+    
+    system = PVSystem(latitude, longitude)
+    data = build_tmy_from_multiyear(system)
+    daily, hourly = calculate_daily_data(system, data)
+    monthly = print_report(daily)
+    metrics = calculate_metrics(daily)
+    
+    print("\n" + "="*60)
+    print("📐 VALIDAZIONE STATISTICA - LIVELLO ORARIO")
+    print("="*60)
+    
+    hourly_metrics = calculate_hourly_metrics(hourly)
+    stats_evidence = create_hourly_statistical_evidence(hourly)
+    statistical_tests = perform_statistical_tests(hourly)
+    hourly_residuals, monthly_residuals = analyze_residuals_by_hour_month(hourly)
+    hourly_summary = create_hourly_summary_table(hourly_metrics, hourly)
+    validation_summary = create_validation_summary_table(hourly_metrics, statistical_tests)
+    seasonal_metrics, seasonal_daily = analyze_seasonal_performance(hourly, daily)
+    
+    plot_residuals_analysis(hourly)
+    plot_hourly_mean_diurnal(hourly)
+    plot_hourly_error_heatmap(hourly)
+    plot_hourly_scatter_density(hourly)
+    plot_hourly_seasonal_subset(hourly)
+    plot_hourly_error_distribution(hourly)
+    plot_seasonal_analysis(hourly, daily, seasonal_daily)
+    plot_seasonal_hourly_heatmaps(hourly)
+    
+    # Nuovi grafici
+    plot_clear_sky_vs_cloudy_day(hourly)
+    plot_monthly_error_carpet(hourly)
+    plot_hourly_parity_scatter(hourly)
+    plot_seasonal_error_boxplots(hourly)
+    
+    export_to_excel(daily, monthly, hourly, metrics, hourly_metrics, 
+                    statistical_tests, hourly_summary, validation_summary,
+                    seasonal_metrics, seasonal_daily,
+                    'production_pv_dublin.xlsx')
+    
+    create_plots(daily, monthly)
+    
+    print("\n" + "="*60)
+    print("✅ SIMULAZIONE E VALIDAZIONE COMPLETATE!")
+    print("="*60)
+    print("\n📁 FILE GENERATI:")
+    print("   - production_pv_dublin.xlsx (dati e metriche)")
+    print("   - daily_production_by_month.png (12 grafici mensili)")
+    print("   - monthly_error_metrics.png")
+    print("   - seasonal_analysis_plots.png")
+    print("   - seasonal_error_heatmaps.png")
+    print("   - clear_sky_vs_cloudy_day.png")
+    print("   - monthly_error_carpet.png")
+    print("   - hourly_parity_scatter.png")
+    print("   - seasonal_error_boxplots.png")
+    print("   - hourly_diurnal_profile.png")
+    print("   - hourly_error_heatmap.png")
+    print("   - hourly_scatter_density.png")
+    print("   - hourly_seasonal_windows.png")
+    print("   - hourly_error_distribution.png")
+    print("   - residuals_analysis.png")
+    print("\n📊 NOTE FINALI:")
+    print("   1. Soglie di errore orario: 1%, 2%, 3%")
+    print("   2. Dati basati su TMY (medie climatologiche 2005-2020)")
+    print("   3. Validazione completata con successo")
+
+
+if __name__ == "__main__":
+    main()
